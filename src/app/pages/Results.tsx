@@ -25,12 +25,18 @@ export function Results() {
   const [inspectSearch, setInspectSearch] = useState<{ [key: number]: string }>({});
   const [inspectFilter, setInspectFilter] = useState<{ [key: number]: 'all' | 'washed' | 'clean' }>({});
 
-  // Gemini API Cloud Audit states
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('gemini_api_key') || '');
-  const [showApiInput, setShowApiInput] = useState(false);
+  const [apiKey, setApiKey] = useState(() => {
+    if (location.state?.apiKey !== undefined) return location.state.apiKey;
+    return localStorage.getItem('gemini_api_key') || '';
+  });
   const [isAiAuditing, setIsAiAuditing] = useState(false);
   const [aiAuditResults, setAiAuditResults] = useState<{ [storeId: string]: { [username: string]: AuditResult } }>({});
   const [apiError, setApiError] = useState('');
+  const [auditModel, setAuditModel] = useState<'gemini' | 'gemma'>(() => {
+    if (location.state?.auditModel) return location.state.auditModel;
+    const key = localStorage.getItem('gemini_api_key') || '';
+    return key.trim() ? 'gemini' : 'gemma';
+  });
 
   // Two-Stage Pipeline Logs State
   interface PipelineLog {
@@ -46,12 +52,22 @@ export function Results() {
 
   // 1. Initial Parse and Compute local heuristics
   useEffect(() => {
-    const computed = storeIds.map(id => {
-      const store = RESTAURANTS_DATA.find(r => r.id === id);
-      if (!store) return null;
-      const reviews = parseReviews(store.csvContent);
-      return computeShopStats(store.name, reviews);
-    }).filter(Boolean) as ShopStats[];
+    const customShops = (location.state?.customShops as Array<{ id: string; name: string; reviews: Review[] }>) || [];
+
+    let computed: ShopStats[] = [];
+    if (customShops.length > 0) {
+      computed = customShops.map(shop => {
+        return computeShopStats(shop.name, shop.reviews);
+      });
+    } else {
+      const activeIds = storeIds.length > 0 ? storeIds : ['ramen_washed_3', 'ramen_clean_2'];
+      computed = activeIds.map(id => {
+        const store = RESTAURANTS_DATA.find(r => r.id === id);
+        if (!store) return null;
+        const reviews = parseReviews(store.csvContent);
+        return computeShopStats(store.name, reviews);
+      }).filter(Boolean) as ShopStats[];
+    }
     
     setShopResults(computed);
     
@@ -64,28 +80,84 @@ export function Results() {
     });
     setInspectSearch(initialSearch);
     setInspectFilter(initialFilter);
-  }, [location.state?.storeIds]);
+  }, [location.state?.storeIds, location.state?.customShops]);
 
-  // 2. Gemini Live AI Audit execution (Two-Stage Hybrid Pipeline)
-  const handleGeminiAudit = async () => {
-    if (!apiKey.trim()) {
+  // 1.5. Auto-trigger AI Audit on mount once shopResults are computed
+  useEffect(() => {
+    if (shopResults.length > 0 && !isAiAuditing && Object.keys(aiAuditResults).length === 0) {
+      const key = location.state?.apiKey !== undefined ? location.state.apiKey : (localStorage.getItem('gemini_api_key') || '');
+      const model = location.state?.auditModel || (key.trim() ? 'gemini' : 'gemma');
+      handleGeminiAudit(model, key, shopResults);
+    }
+  }, [shopResults]);
+
+  // 2. AI Live Audit execution (Two-Stage Hybrid Pipeline)
+  const handleGeminiAudit = async (forcedModel?: 'gemini' | 'gemma', forcedKey?: string, forcedShopResults?: ShopStats[]) => {
+    const activeModel = forcedModel || auditModel;
+    const activeKey = forcedKey !== undefined ? forcedKey : apiKey;
+    const activeShopResults = forcedShopResults || shopResults;
+
+    if (activeModel === 'gemini' && !activeKey.trim()) {
+      // Fallback to local Gemma if Gemini key is missing during auto-trigger
+      if (forcedModel) {
+        console.log('Gemini API key missing, falling back to local Gemma...');
+        setAuditModel('gemma');
+        handleGeminiAudit('gemma', '', activeShopResults);
+        return;
+      }
       setApiError('請輸入有效的 Gemini API 金鑰！');
       return;
     }
     
     setApiError('');
     setIsAiAuditing(true);
-    localStorage.setItem('gemini_api_key', apiKey);
+    if (activeModel === 'gemini') {
+      localStorage.setItem('gemini_api_key', activeKey);
+    }
 
     try {
       const newAiResults = { ...aiAuditResults };
       const logs: PipelineLog[] = [];
 
       // Analyze each selected store
-      for (const id of storeIds) {
-        const store = RESTAURANTS_DATA.find(r => r.id === id);
-        if (!store) continue;
-        const reviews = parseReviews(store.csvContent);
+      for (let idx = 0; idx < activeShopResults.length; idx++) {
+        const result = activeShopResults[idx];
+        const id = storeIds[idx] || `custom_${idx}`;
+        const reviews = result.auditedReviews;
+
+        // Precompute month-level density metrics for this restaurant
+        const monthlyCounts: { [month: string]: number } = {};
+        reviews.forEach(r => {
+          if (r.time) {
+            const month = r.time.substring(0, 7); // YYYY-MM
+            if (/^\d{4}-\d{2}$/.test(month)) {
+              monthlyCounts[month] = (monthlyCounts[month] || 0) + 1;
+            }
+          }
+        });
+
+        const monthKeys = Object.keys(monthlyCounts);
+        const monthlyAverage = monthKeys.length > 0
+          ? monthKeys.reduce((sum, k) => sum + monthlyCounts[k], 0) / monthKeys.length
+          : 0;
+
+        const getReviewTemporalData = (r: Review) => {
+          const month = r.time ? r.time.substring(0, 7) : '';
+          const reviewsInMonth = monthlyCounts[month] || 0;
+          // Spike if month volume is > 2x average AND we have at least 10 reviews in that month
+          const isSpikePeriod = reviewsInMonth > 2 * monthlyAverage && reviewsInMonth >= 10;
+          
+          let daysElapsed = 0;
+          if (r.time) {
+            const reviewDate = new Date(r.time);
+            if (!isNaN(reviewDate.getTime())) {
+              const currentDate = new Date('2026-05-19'); // Metadata local time base
+              const diffTime = currentDate.getTime() - reviewDate.getTime();
+              daysElapsed = Math.max(0, Math.floor(diffTime / (1000 * 60 * 60 * 24)));
+            }
+          }
+          return { isSpikePeriod, daysElapsed };
+        };
 
         // STAGE 1: Regex screening (Local, instant)
         // Find reviews containing explicit incentive/bribe keywords
@@ -102,8 +174,24 @@ export function Results() {
           return r.stars === 5 && !isStage1 && r.text.trim().length > 0;
         });
 
-        // Sample up to 15 ambiguous reviews per store to keep API calls cost-effective and fast
-        const sampleReviews = ambiguousReviews.slice(0, 15);
+        // Get configured AI audit limit (linked to settings/localStorage)
+        const aiAuditLimit = (() => {
+          if (location.state?.aiAuditCount !== undefined) return Number(location.state.aiAuditCount);
+          const saved = localStorage.getItem('ai_audit_count');
+          return saved ? Number(saved) : 15;
+        })();
+
+        // Using uniform stratified sampling across the review timeline
+        let sampleReviews: typeof ambiguousReviews = [];
+        const ambiguousCount = ambiguousReviews.length;
+        if (ambiguousCount <= aiAuditLimit) {
+          sampleReviews = [...ambiguousReviews];
+        } else {
+          for (let i = 0; i < aiAuditLimit; i++) {
+            const index = Math.floor((i * (ambiguousCount - 1)) / (aiAuditLimit - 1));
+            sampleReviews.push(ambiguousReviews[index]);
+          }
+        }
         const stage2Sent = sampleReviews.length;
 
         let stage2Flagged = 0;
@@ -111,69 +199,176 @@ export function Results() {
         const storeMap: { [username: string]: AuditResult } = {};
 
         if (stage2Sent > 0) {
-          // Prepare prompt payload for Stage 2
-          const promptPayload = sampleReviews.map(r => ({
-            username: r.username,
-            stars: r.stars,
-            text: r.text
-          }));
-
-          const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-          const response = await fetch(url, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              contents: [
-                {
-                  parts: [
-                    {
-                      text: `你是一個專門分析 Google Maps 虛假/灌水/刷好評評論的 AI 安全專家。
-                    
-                    我們正在運行一個【兩階段混合審計流水線】：
-                    - 階段一：我們已經使用正則篩選過濾掉了所有顯性打卡交易評論（如包含 "打卡送"、"好評送"）。
-                    - 階段二：請你幫我們審核以下「模糊/高風險」評論列表。請辨識出其中是否隱含「隱性打卡交易行為（如提及評論送單點/飲料，但寫得很隱晦）」、「無食物細節描述的敷衍模版（例如：好吃、環境好，但非常空洞）」或「語意割裂（五星評分但內文是抱怨/平淡詞語）」。
-                    
-                    請精準判斷，並回傳一個嚴格的 JSON 陣列。不要包含任何 Markdown 格式（不要用 \`\`\`json 標記，直接回傳 JSON 字串即可）。
-                    格式範例：
-                    [
-                      {
-                        "username": "評論者姓名",
-                        "isWashed": true/false,
-                        "reason": "為什麼你判定它是洗評或真實的簡短理由（繁體中文）",
-                        "issueType": "incentive"|"template"|"discrepancy"|null
-                      }
-                    ]
-                    
-                    待審計的階段二評論列表：
-                    ${JSON.stringify(promptPayload)}`
-                    }
-                  ]
-                }
-              ],
-              generationConfig: {
-                responseMimeType: "application/json"
-              }
-            })
+          // Prepare prompt payload for Stage 2 with temporal signals
+          const promptPayload = sampleReviews.map(r => {
+            const { isSpikePeriod, daysElapsed } = getReviewTemporalData(r);
+            return {
+              username: r.username,
+              stars: r.stars,
+              text: r.text,
+              daysElapsed,
+              isSpikePeriod
+            };
           });
 
-          if (!response.ok) {
-            let errMsg = response.statusText || `${response.status}`;
-            try {
-              const errBody = await response.json();
-              if (errBody.error && errBody.error.message) {
-                errMsg = errBody.error.message;
-              }
-            } catch (inner) {}
-            throw new Error(`API 請求失敗: ${errMsg}`);
-          }
+          let aiParsed: { 
+            username: string; 
+            isWashed: boolean; 
+            reason: string; 
+            issueType: 'incentive' | 'template' | 'discrepancy' | 'none';
+            reasoningPath: string;
+            incentiveIntensity: number;
+            sentimentAuthenticity: number;
+            descriptionGranularity: number;
+          }[] = [];
 
-          const data = await response.json();
-          const textResponse = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-          
-          // Parse results from Gemini
-          const aiParsed: { username: string; isWashed: boolean; reason: string; issueType: 'incentive' | 'template' | 'discrepancy' | null }[] = JSON.parse(textResponse);
+          if (activeModel === 'gemini') {
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${activeKey}`;
+            const response = await fetch(url, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                contents: [
+                  {
+                    parts: [
+                      {
+                        text: `你是一個專門分析 Google Maps 虛假/灌水/刷好評評論的 AI 安全專家。
+                      
+                      我們正在運行一個【兩階段混合審計流水線】：
+                      - 階段一：我們已經使用正則篩選過濾掉了所有顯性打卡交易評論（如包含 "打卡送"、"好評送"）。
+                      - 階段二：請你幫我們審核以下「模糊/高風險」評論列表。請辨識出其中是否隱含「隱性打卡交易行為（如提及評論送單點/飲料，但寫得很隱晦）」、「無食物細節描述的敷衍模版（例如：好吃、環境好，但非常空洞）」或「語意割裂（五星評分但內文是抱怨/平淡詞語）」。
+                      
+                      為協助你判斷，我們在每則評論中額外提供了以下兩個時間特徵信號：
+                      - "daysElapsed" (數字)：評論發布至今經過的天數。天數越小代表评论越新。
+                      - "isSpikePeriod" (布林值)：該評論是否發布於「評論數量異常暴增的月份」（即該月评论數大於歷史月平均的 2 倍且大於等於 10 則）。若為 true，代表該評論極可能發布於商家的打卡促銷或洗評活動期間。
+                      
+                      請依照以下步驟進行分析判定（Chain-of-Thought 思維鏈）：
+                      1. 分析此評論內文、情感、字數與發佈時間信號，在 \`reasoningPath\` 欄位中詳細寫下你的推理過程與任何疑點。
+                      2. 針對以下三個維度進行 1 到 5 分的指標評分：
+                      - \`incentiveIntensity\` (利益交換強度)：評論是否有為了獲得打卡小點心/折扣而撰寫的痕跡。1 分表示完全無痕跡，5 分表示利益交換特徵極強。
+                      - \`sentimentAuthenticity\` (情感真實度)：評論者表達的喜愛或評價是否自然、真誠。1 分表示極度虛假誇張/空洞，5 分表示極其真誠有具體主觀感受。
+                      - \`descriptionGranularity\` (描述細緻度)：評論中對餐點特色、環境細節、服務態度的具體描繪。1 分表示非常空洞通用，5 分表示細節極為詳盡獨特。
+                      3. 給出最終判定 \`isWashed\` (布林值) 與簡短結論 \`reason\`。
+                      
+                      請精準判斷，並回傳一個嚴格的 JSON 陣列。
+                      
+                      請參考以下判定範例（Few-shot Examples）：
+                      範例一（判定為真實）：
+                      輸入：{"stars": 5, "text": "起司拉麵湯頭濃郁但偏鹹，麵條偏硬，炙燒叉燒很好吃，排隊排了半小時。", "daysElapsed": 60, "isSpikePeriod": false}
+                      輸出：{
+                        "username": "...", 
+                        "reasoningPath": "評論詳細描述了湯頭偏鹹、麵條偏硬與叉燒好吃等細節，且提及排隊時間，情感真實自然。時間非暴增期。無任何利益交換跡象。",
+                        "incentiveIntensity": 1,
+                        "sentimentAuthenticity": 5,
+                        "descriptionGranularity": 5,
+                        "isWashed": false, 
+                        "reason": "包含具體菜色細節、排隊時間與個人化主觀感受，且非暴增期發布，屬於真實評論", 
+                        "issueType": "none"
+                      }
+  
+                      範例二（判定為洗評 - 敷衍模板 + 處於暴增期）：
+                      輸入：{"stars": 5, "text": "味道很棒，氣氛佳，下次還會再來，大力推薦！", "daysElapsed": 365, "isSpikePeriod": true}
+                      輸出：{
+                        "username": "...", 
+                        "reasoningPath": "評論僅有空洞的通用稱讚詞（味道棒、氣氛佳、推薦），缺乏任何具體菜色或環境特徵。且發布於評論數暴增的月份，高度懷疑是為了打卡促銷贈品而撰寫的敷衍模板。",
+                        "incentiveIntensity": 4,
+                        "sentimentAuthenticity": 1,
+                        "descriptionGranularity": 1,
+                        "isWashed": true, 
+                        "reason": "文字極度空洞模板化，且發布於評論數量異常暴增的月份，高機率為促銷洗評", 
+                        "issueType": "template"
+                      }
+  
+                      範例三（判定為洗評 - 隱性打卡 + 早期活動）：
+                      輸入：{"stars": 5, "text": "服務很好，而且評論還有送小點心，推推。", "daysElapsed": 730, "isSpikePeriod": true}
+                      輸出：{
+                        "username": "...", 
+                        "reasoningPath": "內文明確提及評論送東西，屬於直接的贈禮利益交換洗評。天數為兩年前，且發布於當時的評論暴增期。",
+                        "incentiveIntensity": 5,
+                        "sentimentAuthenticity": 2,
+                        "descriptionGranularity": 1,
+                        "isWashed": true, 
+                        "reason": "提及評論送東西，且發布於歷史評論爆發期，屬於典型的贈禮利益交換洗評", 
+                        "issueType": "incentive"
+                      }
+                      
+                      待審計的階段二評論列表：
+                      ${JSON.stringify(promptPayload)}`
+                      }
+                    ]
+                  }
+                ],
+                generationConfig: {
+                  responseMimeType: "application/json",
+                  responseSchema: {
+                    type: "ARRAY",
+                    items: {
+                      type: "OBJECT",
+                      properties: {
+                        username: { type: "STRING" },
+                        isWashed: { type: "BOOLEAN" },
+                        reason: { type: "STRING" },
+                        issueType: { 
+                          type: "STRING", 
+                          enum: ["incentive", "template", "discrepancy", "none"] 
+                        },
+                        reasoningPath: { type: "STRING" },
+                        incentiveIntensity: { type: "INTEGER" },
+                        sentimentAuthenticity: { type: "INTEGER" },
+                        descriptionGranularity: { type: "INTEGER" }
+                      },
+                      required: [
+                        "username", "isWashed", "reason", "issueType", 
+                        "reasoningPath", "incentiveIntensity", "sentimentAuthenticity", "descriptionGranularity"
+                      ]
+                    }
+                  }
+                }
+              })
+            });
+
+            if (!response.ok) {
+              let errMsg = response.statusText || `${response.status}`;
+              try {
+                const errBody = await response.json();
+                if (errBody.error && errBody.error.message) {
+                  errMsg = errBody.error.message;
+                }
+              } catch (inner) {}
+              throw new Error(`API 請求失敗: ${errMsg}`);
+            }
+
+            const data = await response.json();
+            const textResponse = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+            aiParsed = JSON.parse(textResponse);
+          } else {
+            // Local Gemma Model via our Express Server proxy
+            const response = await fetch('http://localhost:5001/api/audit-local', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                reviews: promptPayload
+              })
+            });
+
+            if (!response.ok) {
+              let errMsg = response.statusText || `${response.status}`;
+              try {
+                const errBody = await response.json();
+                if (errBody.error) {
+                  errMsg = errBody.error;
+                }
+              } catch (inner) {}
+              throw new Error(`本地 Gemma 審計失敗: ${errMsg}`);
+            }
+
+            const data = await response.json();
+            aiParsed = data.results || [];
+          }
           
           aiParsed.forEach(item => {
             if (item.isWashed) {
@@ -181,11 +376,31 @@ export function Results() {
             } else {
               stage2Passed++;
             }
+
+            const inc = Number(item.incentiveIntensity) || 3;
+            const aut = Number(item.sentimentAuthenticity) || 3;
+            const gra = Number(item.descriptionGranularity) || 3;
+
+            // Calculate dynamic confidence score based on indicators
+            let confidence = 85;
+            if (item.isWashed) {
+              const fakeScore = (inc + (6 - aut) + (6 - gra)) / 3;
+              confidence = Math.round(60 + (fakeScore - 1) * 9.75);
+            } else {
+              const cleanScore = ((6 - inc) + aut + gra) / 3;
+              confidence = Math.round(60 + (cleanScore - 1) * 9.75);
+            }
+            confidence = Math.max(50, Math.min(99, confidence));
+
             storeMap[item.username] = {
               isWashed: item.isWashed,
-              reason: `🤖 [Gemini 二階段 AI 複審] ${item.reason}`,
-              confidenceScore: item.isWashed ? 98 : 85,
-              issueType: item.issueType
+              reason: item.reason,
+              confidenceScore: confidence,
+              issueType: item.issueType === 'none' ? null : (item.issueType as any),
+              reasoningPath: item.reasoningPath,
+              incentiveIntensity: inc,
+              sentimentAuthenticity: aut,
+              descriptionGranularity: gra
             };
           });
         }
@@ -193,7 +408,7 @@ export function Results() {
         // Add to logs
         logs.push({
           storeId: id,
-          storeName: store.name,
+          storeName: result.storeName,
           totalReviews: reviews.length,
           stage1Count,
           stage2Sent,
@@ -208,17 +423,13 @@ export function Results() {
       setAiAuditResults(newAiResults);
 
       // Recalculate shopResults incorporating Gemini API results
-      const updatedResults = shopResults.map(shop => {
-        const matchingId = storeIds.find(id => {
-          const store = RESTAURANTS_DATA.find(r => r.id === id);
-          return store?.name === shop.storeName;
-        });
+      const updatedResults = activeShopResults.map((shop, idx) => {
+        const matchingId = storeIds[idx] || `custom_${idx}`;
 
-        if (!matchingId || !newAiResults[matchingId]) return shop;
+        if (!newAiResults[matchingId]) return shop;
 
         const aiStoreMap = newAiResults[matchingId];
-        const store = RESTAURANTS_DATA.find(r => r.id === matchingId)!;
-        const reviews = parseReviews(store.csvContent);
+        const reviews = shop.auditedReviews;
 
         // STAGE 1: Regex filter matches
         const stage1WashedReviews = reviews.filter(r => {
@@ -286,8 +497,10 @@ export function Results() {
           }
         });
 
-        const filteredRating = weightTotal > 0 ? weightedSum / weightTotal : shop.originalRating;
-        const trustScore = total > 0 ? (weightTotal / total) * 100 : 100;
+        const basicFilteredRating = weightTotal > 0 ? weightedSum / weightTotal : shop.originalRating;
+        const trustScore = total > 0 ? Math.max(0, 100 - (suspicious / total) * 100 * 2.0) : 100;
+        const trustPenalty = (100 - trustScore) * 0.02;
+        const filteredRating = Math.max(1.0, basicFilteredRating - trustPenalty);
 
         return {
           ...shop,
@@ -332,124 +545,9 @@ export function Results() {
           >
             <ArrowLeft className="w-5 h-5 text-[#6b8e7f]" />
             返回修改對比
-          </motion.button>
+          </motion.button>        </div>
 
-          {/* Gemini AI Trigger Card */}
-          <div className="flex items-center gap-3">
-            <button
-              onClick={() => setShowApiInput(!showApiInput)}
-              className="flex items-center gap-2 bg-gradient-to-r from-[#6b8e7f] to-[#4a5d52] hover:opacity-90 text-white px-5 py-2.5 rounded-full shadow-md transition-all font-bold text-sm cursor-pointer"
-            >
-              <Sparkles className="w-4 h-4 animate-pulse text-[#e8c547]" />
-              {isAiAuditing ? 'Gemini 雲端深度審計中...' : '使用 Gemini AI 雲端複審 (進階)'}
-            </button>
-          </div>
-        </div>
 
-        {/* Gemini API Input Drawer */}
-        <AnimatePresence>
-          {showApiInput && (
-            <motion.div
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: 'auto' }}
-              exit={{ opacity: 0, height: 0 }}
-              className="bg-white rounded-3xl p-6 shadow-lg mb-6 border-2 border-[#6b8e7f] overflow-hidden"
-            >
-              <h3 className="font-extrabold text-base text-[#4a5d52] mb-2 flex items-center gap-2">
-                <Key className="w-5 h-5 text-[#6b8e7f]" />
-                設定 Gemini API 密鑰以啟用深度 AI 審計
-              </h3>
-              <p className="text-xs text-[#6b8e7f] mb-4">
-                本地正則 + Heuristic 規則已能抓出 90% 的洗評；若您想調用大語言模型 (Gemini 1.5 Flash) 進行更敏銳的「語意割裂比對」，請輸入您的 API 金鑰（此金鑰將只保存在您本機的 localStorage 中）。
-              </p>
-              <div className="flex flex-col md:flex-row gap-3">
-                <input
-                  type="password"
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  placeholder="輸入您的 Gemini API 金鑰 (AIzaSy...)"
-                  className="flex-1 px-4 py-2 bg-[#f5f1e8] rounded-xl border border-[#d4c5b0] text-[#4a5d52] text-sm focus:outline-none focus:border-[#6b8e7f]"
-                />
-                <button
-                  onClick={handleGeminiAudit}
-                  disabled={isAiAuditing}
-                  className="bg-[#6b8e7f] hover:bg-[#5b7d6e] text-white px-6 py-2 rounded-xl font-bold text-sm border-2 border-[#4a5d52] flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-                >
-                  {isAiAuditing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
-                  立刻審計數據集
-                </button>
-              </div>
-              {apiError && (
-                <div className="mt-3 text-xs text-[#8c4848] font-semibold bg-[#d4a5a5]/10 p-2.5 rounded-lg border border-[#d4a5a5]/30">
-                  ⚠️ {apiError}
-                </div>
-              )}
-
-              {/* Pipeline Logs Visualization */}
-              {pipelineLogs.length > 0 && (
-                <div className="mt-6 pt-6 border-t border-[#d4c5b0]/60">
-                  <h4 className="font-extrabold text-sm text-[#4a5d52] mb-4 flex items-center gap-2">
-                    <Activity className="w-4.5 h-4.5 text-[#6b8e7f]" />
-                    🛡️ 雙階段混合審計流水線日誌 (Two-Stage Hybrid Audit Pipeline Log)
-                  </h4>
-                  
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {pipelineLogs.map((log) => (
-                      <div key={log.storeId} className="bg-[#f5f1e8] border border-[#d4c5b0] rounded-2xl p-4 text-xs text-[#4a5d52] space-y-3">
-                        <div className="flex justify-between items-center border-b border-[#d4c5b0] pb-2">
-                          <span className="font-extrabold text-[#4a5d52] text-sm">{log.storeName}</span>
-                          <span className="bg-[#6b8e7f] text-white px-2 py-0.5 rounded text-[10px] font-bold">已完成</span>
-                        </div>
-                        
-                        {/* Total Input */}
-                        <div className="flex justify-between items-center">
-                          <span className="text-[#6b8e7f] font-semibold">1. 歷史資料載入</span>
-                          <span className="font-bold">{log.totalReviews} 則評論</span>
-                        </div>
-
-                        {/* Stage 1: Regex */}
-                        <div className="flex justify-between items-center bg-[#d4a5a5]/10 border border-[#d4a5a5]/30 p-2 rounded-lg text-[#8c4848] font-bold">
-                          <span className="flex items-center gap-1">
-                            <span className="w-2 h-2 bg-[#d4a5a5] rounded-full"></span>
-                            階段一：正則過濾 (Regex)
-                          </span>
-                          <span>已攔截 {log.stage1Count} 則顯性打卡評價</span>
-                        </div>
-
-                        {/* Stage 2: Gemini */}
-                        <div className="bg-[#6b8e7f]/10 border border-[#6b8e7f]/30 p-2 rounded-lg text-[#304a3e] font-bold space-y-2">
-                          <div className="flex justify-between items-center">
-                            <span className="flex items-center gap-1">
-                              <span className="w-2 h-2 bg-[#6b8e7f] rounded-full"></span>
-                              階段二：深度 AI 語意 (Gemini)
-                            </span>
-                            <span>送審 {log.stage2Sent} 則模糊評價</span>
-                          </div>
-                          
-                          {log.stage2Sent > 0 && (
-                            <div className="grid grid-cols-2 gap-2 text-[10px] text-center pt-1.5 border-t border-[#6b8e7f]/20">
-                              <div className="bg-[#d4a5a5]/20 text-[#8c4848] py-1 rounded">
-                                判定洗評：<b>{log.stage2Flagged} 則</b>
-                              </div>
-                              <div className="bg-[#6b8e7f]/20 text-[#304a3e] py-1 rounded">
-                                判定真實：<b>{log.stage2Passed} 則</b>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-
-                        {/* Summary pipeline flow */}
-                        <p className="text-[10px] text-[#6b8e7f] italic leading-tight pt-1">
-                          * 該流水線分工極其高效！正則已精準攔截了所有顯性利益交換打卡（0 Token 消耗）；Gemini 則專注審查剩餘的模糊 5 星好評，對其完成了深層「語意割裂」與「模板套用」比對。
-                        </p>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </motion.div>
-          )}
-        </AnimatePresence>
 
         {/* Global Stats Summary Banner */}
         <motion.div
@@ -465,6 +563,22 @@ export function Results() {
             已成功分析 {shopResults.length} 間店家真實 Google Maps 評論數據集
           </p>
         </motion.div>
+
+        {isAiAuditing && (
+          <motion.div
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="bg-white rounded-3xl p-6 shadow-lg mb-6 border-2 border-[#6b8e7f] flex flex-col items-center justify-center text-center animate-pulse"
+          >
+            <Loader2 className="w-8 h-8 animate-spin text-[#6b8e7f] mb-3" />
+            <h3 className="font-extrabold text-base text-[#4a5d52] mb-1">
+              🔍 雙階段 AI 混合審計進行中...
+            </h3>
+            <p className="text-xs text-[#6b8e7f]">
+              正在執行：階段一正則篩選 ➔ 階段二 AI 語意比對與思維鏈推理，請稍候。
+            </p>
+          </motion.div>
+        )}
 
         {/* Winner Card */}
         {shopResults.length > 1 && shopResults[bestStoreIndex] && (
@@ -499,7 +613,7 @@ export function Results() {
           <div className="space-y-8">
             {shopResults.map((result, idx) => {
               const isBest = idx === bestStoreIndex && shopResults.length > 1;
-              const hasMajorDrop = result.originalRating - result.filteredRating >= 0.4;
+              const hasMajorDrop = result.originalRating - result.filteredRating >= 0.3 || result.trustScore < 80;
               
               // Prepare chart data for Recharts
               const distData = [
@@ -654,13 +768,13 @@ export function Results() {
 
                         {/* Text explanation */}
                         <div className="flex flex-col justify-center text-xs text-[#4a5d52]">
-                          {hasMajorDrop ? (
-                            <div className="bg-[#d4a5a5]/10 border border-[#d4a5a5]/30 rounded-xl p-3 text-[#8c4848] font-medium">
-                              ⚠️ <b>警報：</b>濾水後星級大幅縮水了 <b>{(result.originalRating - result.filteredRating).toFixed(2)}</b> 顆星！這代表該店擁有高比例的「五星送福利」灌水，真實就餐口碑在 <b>{result.filteredRating}★</b> 左右。
+                          {result.trustScore < 80 ? (
+                            <div className="bg-[#d4a5a5]/10 border border-[#d4a5a5]/30 rounded-xl p-3 text-[#8c4848] font-medium leading-relaxed">
+                              ⚠️ <b>水軍灌水警報：</b>該店真實信任度僅有 <b>{result.trustScore}%</b>。系統已鎖定 <b>{result.suspiciousReviews}</b> 則疑似打卡贈送或極短模版之灌水五星評論，已對應扣減評分水分（脫水真實得分約為 <b>{result.filteredRating.toFixed(2)}★</b>）。
                             </div>
                           ) : (
-                            <div className="bg-[#6b8e7f]/10 border border-[#6b8e7f]/30 rounded-xl p-3 text-[#304a3e] font-medium">
-                              ✅ <b>信譽優良：</b>濾水前後星級僅相差 <b>{(result.originalRating - result.filteredRating).toFixed(2)}</b> 顆星，無明顯灌水行徑，評價皆為自然就餐真實反饋。
+                            <div className="bg-[#6b8e7f]/10 border border-[#6b8e7f]/30 rounded-xl p-3 text-[#304a3e] font-medium leading-relaxed">
+                              ✅ <b>信譽優良：</b>該店真實信任度達 <b>{result.trustScore}%</b>，無明顯系統性灌水行徑，真實口碑約 <b>{result.filteredRating.toFixed(2)}★</b>，評價皆為自然就餐真實反饋。
                             </div>
                           )}
                         </div>
@@ -695,6 +809,62 @@ export function Results() {
                         <span className="flex items-center gap-1.5"><span className="w-3 h-3 bg-[#6b8e7f] rounded-sm"></span>真實有機評分分佈</span>
                       </div>
                     </div>
+
+                    {/* Integrated Two-Stage Audit Pipeline Log */}
+                    {(() => {
+                      const storeLog = pipelineLogs.find(log => log.storeName === result.storeName);
+                      if (!storeLog) return null;
+                      return (
+                        <div className="bg-[#f5f1e8] border-2 border-[#d4c5b0] rounded-2xl p-4 text-xs text-[#4a5d52] space-y-3">
+                          <h4 className="text-xs font-extrabold text-[#4a5d52] uppercase tracking-wider mb-1 flex items-center gap-1.5">
+                            <Activity className="w-4.5 h-4.5 text-[#6b8e7f]" />
+                            🛡️ 雙階段混合審計流水線日誌 (Two-Stage Hybrid Audit Pipeline Log)
+                          </h4>
+                          
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            {/* Total Input */}
+                            <div className="bg-white border border-[#d4c5b0] p-3 rounded-xl flex flex-col justify-between">
+                              <span className="text-[#6b8e7f] font-bold block mb-1">1. 歷史資料載入</span>
+                              <span className="text-base font-black text-[#4a5d52]">{storeLog.totalReviews} 則評論</span>
+                            </div>
+
+                            {/* Stage 1: Regex */}
+                            <div className="bg-[#d4a5a5]/10 border border-[#d4a5a5]/30 p-3 rounded-xl flex flex-col justify-between text-[#8c4848]">
+                              <span className="font-bold block mb-1 flex items-center gap-1">
+                                <span className="w-2 h-2 rounded-full bg-[#8c4848]"></span>
+                                階段一：啟發式過濾
+                              </span>
+                              <span className="text-base font-black">已攔截 {storeLog.stage1Count} 則</span>
+                            </div>
+
+                            {/* Stage 2: Gemini */}
+                            <div className="bg-white border border-[#d4c5b0] p-3 rounded-xl flex flex-col justify-between">
+                              <span className="font-bold block mb-1 flex items-center gap-1">
+                                <span className="w-2 h-2 rounded-full bg-[#6b8e7f]"></span>
+                                階段二：深度 AI 語意
+                              </span>
+                              <div className="flex justify-between items-center">
+                                <span className="text-sm font-extrabold text-[#4a5d52]">送審 {storeLog.stage2Sent} 則</span>
+                                {storeLog.stage2Sent > 0 && (
+                                  <div className="flex gap-1.5 text-[10px]">
+                                    <span className="bg-[#d4a5a5]/20 text-[#8c4848] px-1.5 py-0.5 rounded font-bold">
+                                      洗評:{storeLog.stage2Flagged}
+                                    </span>
+                                    <span className="bg-[#6b8e7f]/20 text-[#304a3e] px-1.5 py-0.5 rounded font-bold">
+                                      真實:{storeLog.stage2Passed}
+                                    </span>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+
+                          <p className="text-[10px] text-[#6b8e7f] italic leading-tight pt-1">
+                            * 本系統採用兩階段流水線分工：階段一以本地正則和規則引擎快速攔截顯性打卡（0 Token 消耗，保護隱私）；階段二調用 {auditModel === 'gemini' ? 'Gemini 2.5 Flash 雲端 API' : '本地 Gemma 4:e4b 模型'} 對剩餘的模糊 5 星好評進行語意複審與思維鏈推理。
+                          </p>
+                        </div>
+                      );
+                    })()}
 
                     {/* Detailed Review Inspector */}
                     <div className="bg-white rounded-2xl border border-[#d4c5b0] overflow-hidden">
@@ -758,14 +928,60 @@ export function Results() {
                               
                               {/* Audit Status Box */}
                               {review.audit.isWashed ? (
-                                <div className="bg-[#d4a5a5]/10 border border-[#d4a5a5]/30 p-2 rounded-lg text-[11px] text-[#8c4848] font-bold flex items-start gap-1">
-                                  <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-                                  <span>⚠️ {review.audit.reason}</span>
+                                <div className="bg-[#d4a5a5]/10 border border-[#d4a5a5]/30 p-3 rounded-xl text-xs text-[#8c4848] space-y-2">
+                                  <div className="flex items-start gap-1.5 font-bold">
+                                    <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#8c4848]" />
+                                    <span>判定：灌水洗評 ({review.audit.confidenceScore}% 信心度)</span>
+                                  </div>
+                                  <div className="text-[11px] font-medium opacity-90 pl-5 leading-relaxed">
+                                    <b>原因：</b>{review.audit.reason}
+                                  </div>
+                                  {review.audit.reasoningPath && (
+                                    <div className="mt-2 pt-2 border-t border-[#d4a5a5]/20 pl-5 text-[10px] space-y-2">
+                                      <div className="text-[#8c4848]/90 leading-relaxed bg-[#f5f1e8]/60 p-2 rounded-lg italic border border-[#d4c5b0]/30">
+                                        <b>💡 AI 思考鏈 (CoT)：</b>{review.audit.reasoningPath}
+                                      </div>
+                                      <div className="grid grid-cols-3 gap-2 text-[9px] text-center pt-1 font-bold">
+                                        <div className="bg-[#d4a5a5]/20 py-1 px-1.5 rounded">
+                                          利益誘因: <span className="text-[#8c4848] font-black">{review.audit.incentiveIntensity}/5</span>
+                                        </div>
+                                        <div className="bg-[#d4a5a5]/20 py-1 px-1.5 rounded">
+                                          情感真實: <span className="text-[#8c4848] font-black">{review.audit.sentimentAuthenticity}/5</span>
+                                        </div>
+                                        <div className="bg-[#d4a5a5]/20 py-1 px-1.5 rounded">
+                                          描述細緻: <span className="text-[#8c4848] font-black">{review.audit.descriptionGranularity}/5</span>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  )}
                                 </div>
                               ) : (
-                                <div className="bg-[#6b8e7f]/10 border border-[#6b8e7f]/30 p-2 rounded-lg text-[11px] text-[#304a3e] font-bold flex items-start gap-1">
-                                  <Check className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-                                  <span>{review.audit.reason}</span>
+                                <div className="bg-[#6b8e7f]/10 border border-[#6b8e7f]/30 p-3 rounded-xl text-xs text-[#304a3e] space-y-2">
+                                  <div className="flex items-start gap-1.5 font-bold">
+                                    <Check className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#6b8e7f]" />
+                                    <span>判定：真實評論 ({review.audit.confidenceScore}% 信心度)</span>
+                                  </div>
+                                  <div className="text-[11px] font-medium opacity-90 pl-5 leading-relaxed">
+                                    <b>原因：</b>{review.audit.reason}
+                                  </div>
+                                  {review.audit.reasoningPath && (
+                                    <div className="mt-2 pt-2 border-t border-[#6b8e7f]/20 pl-5 text-[10px] space-y-2">
+                                      <div className="text-[#304a3e]/90 leading-relaxed bg-[#f5f1e8]/60 p-2 rounded-lg italic border border-[#d4c5b0]/30">
+                                        <b>💡 AI 思考鏈 (CoT)：</b>{review.audit.reasoningPath}
+                                      </div>
+                                      <div className="grid grid-cols-3 gap-2 text-[9px] text-center pt-1 font-bold">
+                                        <div className="bg-[#6b8e7f]/20 py-1 px-1.5 rounded">
+                                          利益誘因: <span className="text-[#304a3e] font-black">{review.audit.incentiveIntensity}/5</span>
+                                        </div>
+                                        <div className="bg-[#6b8e7f]/20 py-1 px-1.5 rounded">
+                                          情感真實: <span className="text-[#304a3e] font-black">{review.audit.sentimentAuthenticity}/5</span>
+                                        </div>
+                                        <div className="bg-[#6b8e7f]/20 py-1 px-1.5 rounded">
+                                          描述細緻: <span className="text-[#304a3e] font-black">{review.audit.descriptionGranularity}/5</span>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  )}
                                 </div>
                               )}
                             </div>

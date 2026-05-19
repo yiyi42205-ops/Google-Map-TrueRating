@@ -1,25 +1,25 @@
-import ramen_washed_1 from '../../../restaurant_data/拉麵＿有洗/好假拉麵通化.csv?raw';
-import ramen_washed_2 from '../../../restaurant_data/拉麵＿有洗/好呷拉麵師大.csv?raw';
-import ramen_washed_3 from '../../../restaurant_data/拉麵＿有洗/麵屋長樂.csv?raw';
+import ramen_washed_1 from '../../../restaurant_data/拉麵＿有洗/好呷拉麵X燒咖哩通化.csv?raw';
+import ramen_washed_2 from '../../../restaurant_data/拉麵＿有洗/好呷拉麵 甜品吃到飽(師大).csv?raw';
+import ramen_washed_3 from '../../../restaurant_data/拉麵＿有洗/麵屋長樂 台灣本店.csv?raw';
 
 import ramen_clean_1 from '../../../restaurant_data/拉麵＿沒洗/十二巷拉麵.csv?raw';
-import ramen_clean_2 from '../../../restaurant_data/拉麵＿沒洗/小高拉麵.csv?raw';
+import ramen_clean_2 from '../../../restaurant_data/拉麵＿沒洗/小高拉麵 公館.csv?raw';
 import ramen_clean_3 from '../../../restaurant_data/拉麵＿沒洗/隱家拉麵公館.csv?raw';
 
 import bento_washed_1 from '../../../restaurant_data/便當＿有洗/城市盒子寧波.csv?raw';
 import bento_washed_2 from '../../../restaurant_data/便當＿有洗/村民餐盒.csv?raw';
-import bento_washed_3 from '../../../restaurant_data/便當＿有洗/米泰豐便當.csv?raw';
+import bento_washed_3 from '../../../restaurant_data/便當＿有洗/米泰豐.csv?raw';
 
-import bento_clean_1 from '../../../restaurant_data/便當＿沒洗/lulu原型餐盒.csv?raw';
+import bento_clean_1 from '../../../restaurant_data/便當＿沒洗/lulu lin 原型飯包金山店.csv?raw';
 import bento_clean_2 from '../../../restaurant_data/便當＿沒洗/餵way.csv?raw';
-import bento_clean_3 from '../../../restaurant_data/便當＿沒洗/龍城.csv?raw';
+import bento_clean_3 from '../../../restaurant_data/便當＿沒洗/龍城精緻快餐.csv?raw';
 
 import drink_washed_1 from '../../../restaurant_data/手搖＿有洗/深夜茶飲.csv?raw';
-import drink_washed_2 from '../../../restaurant_data/手搖＿有洗/發發公館牧場.csv?raw';
-import drink_washed_3 from '../../../restaurant_data/手搖＿有洗/茶沐.csv?raw';
+import drink_washed_2 from '../../../restaurant_data/手搖＿有洗/發發公館牧場491.csv?raw';
+import drink_washed_3 from '../../../restaurant_data/手搖＿有洗/茶沐-茶飲專賣店.csv?raw';
 
 import drink_clean_1 from '../../../restaurant_data/手搖＿沒洗/可不可公館.csv?raw';
-import drink_clean_2 from '../../../restaurant_data/手搖＿沒洗/清心師大.csv?raw';
+import drink_clean_2 from '../../../restaurant_data/手搖＿沒洗/清新師大.csv?raw';
 import drink_clean_3 from '../../../restaurant_data/手搖＿沒洗/迷客夏延吉.csv?raw';
 
 export interface Restaurant {
