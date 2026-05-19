@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
-    "dev": "node review_scraper/server.js & vite"
+    "dev": "vite",
+    "dev:scraper": "review_scraper/venv/bin/python review_scraper/server.py || python3 review_scraper/server.py || python review_scraper/server.py"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",

@@ -3,13 +3,88 @@ import { motion, AnimatePresence } from 'motion/react';
 import { useNavigate, useLocation } from 'react-router';
 import { 
   ArrowLeft, Trophy, AlertTriangle, ExternalLink, Search, 
-  Sparkles, Check, Loader2, ShieldCheck, HelpCircle, FileText, Key, Activity
+  Sparkles, Check, Loader2, ShieldCheck, HelpCircle, FileText, Key, Activity,
+  ChevronDown, ChevronUp, Star, Shield, X, Database
 } from 'lucide-react';
-import { DispenseSlot } from '../components/DispenseSlot';
 import { RESTAURANTS_DATA } from '../data/restaurantsData';
 import { parseReviews, Review } from '../utils/csvParser';
 import { computeShopStats, auditReview, ShopStats, AuditResult } from '../utils/auditEngine';
 import { ResponsiveContainer, BarChart, CartesianGrid, XAxis, YAxis, Tooltip, Bar } from 'recharts';
+import auditPromptTemplate from '../../../review_scraper/audit_prompt.txt?raw';
+
+function cleanStoreName(name: string): string {
+  if (!name) return '';
+  const parts = name.split(',');
+  if (parts.length <= 1) return name.trim();
+  
+  const addressKeywords = [
+    'city', 'district', 'town', 'county', 'road', 'street', 'lane', 'alley', 'section', 'village',
+    '市', '區', '鄉', '鎮', '縣', '路', '街', '巷', '弄', '段', '里'
+  ];
+  
+  const nonAddressParts = parts.filter(part => {
+    const lower = part.toLowerCase();
+    return !addressKeywords.some(keyword => lower.includes(keyword));
+  });
+  
+  if (nonAddressParts.length > 0) {
+    return nonAddressParts[nonAddressParts.length - 1].trim();
+  }
+  
+  return parts[parts.length - 1].trim();
+}
+
+function sanitizeJsonString(rawStr: string): string {
+  // 1. Remove trailing commas in arrays/objects
+  let cleaned = rawStr.replace(/,\s*([\]}])/g, '$1');
+  
+  // 2. Escape double quotes inside values.
+  const stringFields = ["username", "reason", "reasoningPath", "issueType"];
+  const lines = cleaned.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i];
+    for (const field of stringFields) {
+      const prefix = `"${field}": "`;
+      if (line.includes(prefix)) {
+        const startIdx = line.indexOf(prefix) + prefix.length;
+        const endIdx = line.lastIndexOf('"');
+        if (endIdx > startIdx) {
+          const innerVal = line.substring(startIdx, endIdx);
+          const escapedVal = innerVal.replace(/(?<!\\)"/g, '\\"');
+          const suffix = line.substring(endIdx);
+          line = line.substring(0, startIdx) + escapedVal + suffix;
+        }
+        break;
+      }
+    }
+    lines[i] = line;
+  }
+  return lines.join('\n');
+}
+
+function closeMalformedJson(jsonStr: string): string {
+  let str = jsonStr.trim();
+  const quoteCount = (str.match(/"/g) || []).length;
+  if (quoteCount % 2 !== 0) {
+    str += '"';
+  }
+  
+  let openBraces = (str.match(/\{/g) || []).length;
+  let closeBraces = (str.match(/\}/g) || []).length;
+  while (openBraces > closeBraces) {
+    str += '}';
+    closeBraces++;
+  }
+  
+  let openBrackets = (str.match(/\[/g) || []).length;
+  let closeBrackets = (str.match(/\]/g) || []).length;
+  while (openBrackets > closeBrackets) {
+    str += ']';
+    closeBrackets++;
+  }
+  
+  return str;
+}
 
 export function Results() {
   const navigate = useNavigate();
@@ -37,6 +112,19 @@ export function Results() {
     const key = localStorage.getItem('gemini_api_key') || '';
     return key.trim() ? 'gemini' : 'gemma';
   });
+  const ollamaModelTag = location.state?.ollamaModelTag || localStorage.getItem('ollama_model_tag') || 'gemma4:e4b';
+
+  // Accordion state for CoT reasoning paths (keyed by "storeIdx-reviewIdx")
+  const [expandedCoT, setExpandedCoT] = useState<{ [key: string]: boolean }>({});
+
+  // Active Store Index for detailed inspector tabs
+  const [selectedInspectorTab, setSelectedInspectorTab] = useState(0);
+
+  // Synchronized sub-metric tab state across all compared stores
+  const [activeSubTab, setActiveSubTab] = useState<'rating' | 'anomalies' | 'charts'>('rating');
+
+  // Active store tab selected in the top switcher navbar ('all' or storeIndex)
+  const [activeStoreTab, setActiveStoreTab] = useState<number | 'all'>('all');
 
   // Two-Stage Pipeline Logs State
   interface PipelineLog {
@@ -98,7 +186,6 @@ export function Results() {
     const activeShopResults = forcedShopResults || shopResults;
 
     if (activeModel === 'gemini' && !activeKey.trim()) {
-      // Fallback to local Gemma if Gemini key is missing during auto-trigger
       if (forcedModel) {
         console.log('Gemini API key missing, falling back to local Gemma...');
         setAuditModel('gemma');
@@ -119,13 +206,11 @@ export function Results() {
       const newAiResults = { ...aiAuditResults };
       const logs: PipelineLog[] = [];
 
-      // Analyze each selected store
       for (let idx = 0; idx < activeShopResults.length; idx++) {
         const result = activeShopResults[idx];
         const id = storeIds[idx] || `custom_${idx}`;
         const reviews = result.auditedReviews;
 
-        // Precompute month-level density metrics for this restaurant
         const monthlyCounts: { [month: string]: number } = {};
         reviews.forEach(r => {
           if (r.time) {
@@ -144,14 +229,13 @@ export function Results() {
         const getReviewTemporalData = (r: Review) => {
           const month = r.time ? r.time.substring(0, 7) : '';
           const reviewsInMonth = monthlyCounts[month] || 0;
-          // Spike if month volume is > 2x average AND we have at least 10 reviews in that month
           const isSpikePeriod = reviewsInMonth > 2 * monthlyAverage && reviewsInMonth >= 10;
           
           let daysElapsed = 0;
           if (r.time) {
             const reviewDate = new Date(r.time);
             if (!isNaN(reviewDate.getTime())) {
-              const currentDate = new Date('2026-05-19'); // Metadata local time base
+              const currentDate = new Date('2026-05-19');
               const diffTime = currentDate.getTime() - reviewDate.getTime();
               daysElapsed = Math.max(0, Math.floor(diffTime / (1000 * 60 * 60 * 24)));
             }
@@ -159,29 +243,23 @@ export function Results() {
           return { isSpikePeriod, daysElapsed };
         };
 
-        // STAGE 1: Regex screening (Local, instant)
-        // Find reviews containing explicit incentive/bribe keywords
         const stage1WashedReviews = reviews.filter(r => {
           const audit = auditReview(r);
           return audit.isWashed && audit.issueType === 'incentive';
         });
         const stage1Count = stage1WashedReviews.length;
 
-        // STAGE 2: Identify Ambiguous / High-Risk Reviews for Gemini AI
-        // 5-star reviews that are NOT flagged by Stage 1, and contain some text
         const ambiguousReviews = reviews.filter(r => {
           const isStage1 = stage1WashedReviews.some(s1 => s1.username === r.username && s1.text === r.text);
           return r.stars === 5 && !isStage1 && r.text.trim().length > 0;
         });
 
-        // Get configured AI audit limit (linked to settings/localStorage)
         const aiAuditLimit = (() => {
           if (location.state?.aiAuditCount !== undefined) return Number(location.state.aiAuditCount);
           const saved = localStorage.getItem('ai_audit_count');
           return saved ? Number(saved) : 15;
         })();
 
-        // Using uniform stratified sampling across the review timeline
         let sampleReviews: typeof ambiguousReviews = [];
         const ambiguousCount = ambiguousReviews.length;
         if (ambiguousCount <= aiAuditLimit) {
@@ -199,193 +277,150 @@ export function Results() {
         const storeMap: { [username: string]: AuditResult } = {};
 
         if (stage2Sent > 0) {
-          // Prepare prompt payload for Stage 2 with temporal signals
-          const promptPayload = sampleReviews.map(r => {
+          const promptPayload = sampleReviews.map((r, rIdx) => {
             const { isSpikePeriod, daysElapsed } = getReviewTemporalData(r);
             return {
+              index: rIdx,
               username: r.username,
-              stars: r.stars,
               text: r.text,
+              stars: r.stars,
               daysElapsed,
               isSpikePeriod
             };
           });
 
-          let aiParsed: { 
-            username: string; 
-            isWashed: boolean; 
-            reason: string; 
-            issueType: 'incentive' | 'template' | 'discrepancy' | 'none';
-            reasoningPath: string;
-            incentiveIntensity: number;
-            sentimentAuthenticity: number;
-            descriptionGranularity: number;
-          }[] = [];
+          const prompt = auditPromptTemplate
+            .replace('{store_name}', result.storeName)
+            .replace('{review_count}', stage2Sent.toString())
+            .replace('{reviews_json}', JSON.stringify(promptPayload, null, 2));
+
+          let items: any[] = [];
 
           if (activeModel === 'gemini') {
-            const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${activeKey}`;
-            const response = await fetch(url, {
+            const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${activeKey}`, {
               method: 'POST',
               headers: {
-                'Content-Type': 'application/json',
+                'Content-Type': 'application/json'
               },
               body: JSON.stringify({
-                contents: [
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: {
+                  responseMimeType: 'application/json'
+                }
+              })
+            });
+
+            if (!response.ok) {
+              const errData = await response.json();
+              throw new Error(errData.error?.message || 'Gemini API 請求失敗');
+            }
+
+            const resData = await response.json();
+            const textResponse = resData.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+            try {
+              items = JSON.parse(sanitizeJsonString(textResponse));
+            } catch (e) {
+              try {
+                items = JSON.parse(closeMalformedJson(sanitizeJsonString(textResponse)));
+              } catch (e2) {
+                console.error("Failed to parse Gemini response. Raw string:", textResponse);
+                throw new Error(`Gemini 語意審計失敗，模型回傳格式非合規 JSON：\n${e2.message || e2}`);
+              }
+            }
+          } else {
+            const response = await fetch('/api/ollama/api/chat', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({
+                model: ollamaModelTag,
+                messages: [
                   {
-                    parts: [
-                      {
-                        text: `你是一個專門分析 Google Maps 虛假/灌水/刷好評評論的 AI 安全專家。
-                      
-                      我們正在運行一個【兩階段混合審計流水線】：
-                      - 階段一：我們已經使用正則篩選過濾掉了所有顯性打卡交易評論（如包含 "打卡送"、"好評送"）。
-                      - 階段二：請你幫我們審核以下「模糊/高風險」評論列表。請辨識出其中是否隱含「隱性打卡交易行為（如提及評論送單點/飲料，但寫得很隱晦）」、「無食物細節描述的敷衍模版（例如：好吃、環境好，但非常空洞）」或「語意割裂（五星評分但內文是抱怨/平淡詞語）」。
-                      
-                      為協助你判斷，我們在每則評論中額外提供了以下兩個時間特徵信號：
-                      - "daysElapsed" (數字)：評論發布至今經過的天數。天數越小代表评论越新。
-                      - "isSpikePeriod" (布林值)：該評論是否發布於「評論數量異常暴增的月份」（即該月评论數大於歷史月平均的 2 倍且大於等於 10 則）。若為 true，代表該評論極可能發布於商家的打卡促銷或洗評活動期間。
-                      
-                      請依照以下步驟進行分析判定（Chain-of-Thought 思維鏈）：
-                      1. 分析此評論內文、情感、字數與發佈時間信號，在 \`reasoningPath\` 欄位中詳細寫下你的推理過程與任何疑點。
-                      2. 針對以下三個維度進行 1 到 5 分的指標評分：
-                      - \`incentiveIntensity\` (利益交換強度)：評論是否有為了獲得打卡小點心/折扣而撰寫的痕跡。1 分表示完全無痕跡，5 分表示利益交換特徵極強。
-                      - \`sentimentAuthenticity\` (情感真實度)：評論者表達的喜愛或評價是否自然、真誠。1 分表示極度虛假誇張/空洞，5 分表示極其真誠有具體主觀感受。
-                      - \`descriptionGranularity\` (描述細緻度)：評論中對餐點特色、環境細節、服務態度的具體描繪。1 分表示非常空洞通用，5 分表示細節極為詳盡獨特。
-                      3. 給出最終判定 \`isWashed\` (布林值) 與簡短結論 \`reason\`。
-                      
-                      請精準判斷，並回傳一個嚴格的 JSON 陣列。
-                      
-                      請參考以下判定範例（Few-shot Examples）：
-                      範例一（判定為真實）：
-                      輸入：{"stars": 5, "text": "起司拉麵湯頭濃郁但偏鹹，麵條偏硬，炙燒叉燒很好吃，排隊排了半小時。", "daysElapsed": 60, "isSpikePeriod": false}
-                      輸出：{
-                        "username": "...", 
-                        "reasoningPath": "評論詳細描述了湯頭偏鹹、麵條偏硬與叉燒好吃等細節，且提及排隊時間，情感真實自然。時間非暴增期。無任何利益交換跡象。",
-                        "incentiveIntensity": 1,
-                        "sentimentAuthenticity": 5,
-                        "descriptionGranularity": 5,
-                        "isWashed": false, 
-                        "reason": "包含具體菜色細節、排隊時間與個人化主觀感受，且非暴增期發布，屬於真實評論", 
-                        "issueType": "none"
-                      }
-  
-                      範例二（判定為洗評 - 敷衍模板 + 處於暴增期）：
-                      輸入：{"stars": 5, "text": "味道很棒，氣氛佳，下次還會再來，大力推薦！", "daysElapsed": 365, "isSpikePeriod": true}
-                      輸出：{
-                        "username": "...", 
-                        "reasoningPath": "評論僅有空洞的通用稱讚詞（味道棒、氣氛佳、推薦），缺乏任何具體菜色或環境特徵。且發布於評論數暴增的月份，高度懷疑是為了打卡促銷贈品而撰寫的敷衍模板。",
-                        "incentiveIntensity": 4,
-                        "sentimentAuthenticity": 1,
-                        "descriptionGranularity": 1,
-                        "isWashed": true, 
-                        "reason": "文字極度空洞模板化，且發布於評論數量異常暴增的月份，高機率為促銷洗評", 
-                        "issueType": "template"
-                      }
-  
-                      範例三（判定為洗評 - 隱性打卡 + 早期活動）：
-                      輸入：{"stars": 5, "text": "服務很好，而且評論還有送小點心，推推。", "daysElapsed": 730, "isSpikePeriod": true}
-                      輸出：{
-                        "username": "...", 
-                        "reasoningPath": "內文明確提及評論送東西，屬於直接的贈禮利益交換洗評。天數為兩年前，且發布於當時的評論暴增期。",
-                        "incentiveIntensity": 5,
-                        "sentimentAuthenticity": 2,
-                        "descriptionGranularity": 1,
-                        "isWashed": true, 
-                        "reason": "提及評論送東西，且發布於歷史評論爆發期，屬於典型的贈禮利益交換洗評", 
-                        "issueType": "incentive"
-                      }
-                      
-                      待審計的階段二評論列表：
-                      ${JSON.stringify(promptPayload)}`
-                      }
-                    ]
+                    role: 'user',
+                    content: prompt
                   }
                 ],
-                generationConfig: {
-                  responseMimeType: "application/json",
-                  responseSchema: {
-                    type: "ARRAY",
-                    items: {
-                      type: "OBJECT",
-                      properties: {
-                        username: { type: "STRING" },
-                        isWashed: { type: "BOOLEAN" },
-                        reason: { type: "STRING" },
-                        issueType: { 
-                          type: "STRING", 
-                          enum: ["incentive", "template", "discrepancy", "none"] 
-                        },
-                        reasoningPath: { type: "STRING" },
-                        incentiveIntensity: { type: "INTEGER" },
-                        sentimentAuthenticity: { type: "INTEGER" },
-                        descriptionGranularity: { type: "INTEGER" }
-                      },
-                      required: [
-                        "username", "isWashed", "reason", "issueType", 
-                        "reasoningPath", "incentiveIntensity", "sentimentAuthenticity", "descriptionGranularity"
-                      ]
-                    }
-                  }
-                }
+                options: {
+                  temperature: 0.1
+                },
+                format: 'json',
+                stream: false
               })
             });
 
             if (!response.ok) {
-              let errMsg = response.statusText || `${response.status}`;
-              try {
-                const errBody = await response.json();
-                if (errBody.error && errBody.error.message) {
-                  errMsg = errBody.error.message;
-                }
-              } catch (inner) {}
-              throw new Error(`API 請求失敗: ${errMsg}`);
+              const errText = await response.text().catch(() => '');
+              throw new Error(`本地 Ollama 服務回傳錯誤，請確認本機 Ollama 運作中且已下載模型 "${ollamaModelTag}"。${errText ? `錯誤訊息: ${errText}` : ''}`);
             }
 
-            const data = await response.json();
-            const textResponse = data.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-            aiParsed = JSON.parse(textResponse);
-          } else {
-            // Local Gemma Model via our Express Server proxy
-            const response = await fetch('http://localhost:5001/api/audit-local', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                reviews: promptPayload
-              })
-            });
-
-            if (!response.ok) {
-              let errMsg = response.statusText || `${response.status}`;
-              try {
-                const errBody = await response.json();
-                if (errBody.error) {
-                  errMsg = errBody.error;
-                }
-              } catch (inner) {}
-              throw new Error(`本地 Gemma 審計失敗: ${errMsg}`);
+            const responseJson = await response.json();
+            if (!responseJson.message || !responseJson.message.content) {
+              throw new Error('本地 Ollama 回傳資料格式不正確');
             }
-
-            const data = await response.json();
-            aiParsed = data.results || [];
+            
+            let contentStr = responseJson.message.content.trim();
+            // Strip markdown fences
+            if (contentStr.startsWith('```')) {
+              contentStr = contentStr.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
+            }
+            
+            // Extract JSON array or object using regex to ignore any surrounding chat text
+            const arrayMatch = contentStr.match(/\[\s*\{[\s\S]*\}\s*\]/);
+            if (arrayMatch) {
+              contentStr = arrayMatch[0];
+            } else {
+              const objMatch = contentStr.match(/\{\s*[\s\S]*\}/);
+              if (objMatch) {
+                contentStr = objMatch[0];
+              }
+            }
+            
+            let parsedContent;
+            try {
+              parsedContent = JSON.parse(sanitizeJsonString(contentStr));
+            } catch (e) {
+              try {
+                parsedContent = JSON.parse(closeMalformedJson(sanitizeJsonString(contentStr)));
+              } catch (e2) {
+                console.error("Failed to parse local Ollama response. Raw string:", contentStr);
+                throw new Error(`本地 Ollama 語意審計失敗，模型回傳格式非合規 JSON：\n${e2.message || e2}`);
+              }
+            }
+            
+            // Normalize array if model wrapped it in an object like {"reviews": [...]}
+            if (!Array.isArray(parsedContent)) {
+              if (parsedContent.reviews && Array.isArray(parsedContent.reviews)) {
+                parsedContent = parsedContent.reviews;
+              } else if (parsedContent.results && Array.isArray(parsedContent.results)) {
+                parsedContent = parsedContent.results;
+              } else {
+                const arrayKey = Object.keys(parsedContent).find(k => Array.isArray(parsedContent[k]));
+                if (arrayKey) {
+                  parsedContent = parsedContent[arrayKey];
+                } else {
+                  throw new Error('模型未回傳 JSON 陣列審查結果');
+                }
+              }
+            }
+            items = parsedContent;
           }
-          
-          aiParsed.forEach(item => {
+
+          items.forEach(item => {
             if (item.isWashed) {
               stage2Flagged++;
             } else {
               stage2Passed++;
             }
 
-            const inc = Number(item.incentiveIntensity) || 3;
-            const aut = Number(item.sentimentAuthenticity) || 3;
-            const gra = Number(item.descriptionGranularity) || 3;
-
-            // Calculate dynamic confidence score based on indicators
-            let confidence = 85;
+            const inc = item.incentiveIntensity || 3;
+            const aut = item.sentimentAuthenticity || 3;
+            const gra = item.descriptionGranularity || 3;
+            
+            let confidence = 50;
             if (item.isWashed) {
-              const fakeScore = (inc + (6 - aut) + (6 - gra)) / 3;
-              confidence = Math.round(60 + (fakeScore - 1) * 9.75);
+              const washScore = (inc + (6 - aut) + (6 - gra)) / 3;
+              confidence = Math.round(60 + (washScore - 1) * 9.75);
             } else {
               const cleanScore = ((6 - inc) + aut + gra) / 3;
               confidence = Math.round(60 + (cleanScore - 1) * 9.75);
@@ -405,7 +440,6 @@ export function Results() {
           });
         }
 
-        // Add to logs
         logs.push({
           storeId: id,
           storeName: result.storeName,
@@ -422,7 +456,6 @@ export function Results() {
       setPipelineLogs(logs);
       setAiAuditResults(newAiResults);
 
-      // Recalculate shopResults incorporating Gemini API results
       const updatedResults = activeShopResults.map((shop, idx) => {
         const matchingId = storeIds[idx] || `custom_${idx}`;
 
@@ -431,28 +464,25 @@ export function Results() {
         const aiStoreMap = newAiResults[matchingId];
         const reviews = shop.auditedReviews;
 
-        // STAGE 1: Regex filter matches
         const stage1WashedReviews = reviews.filter(r => {
           const audit = auditReview(r);
           return audit.isWashed && audit.issueType === 'incentive';
         });
 
         const updatedReviews = shop.auditedReviews.map(r => {
-          // Check if flagged in Stage 1
           const isStage1 = stage1WashedReviews.some(s1 => s1.username === r.username && s1.text === r.text);
           if (isStage1) {
             return {
               ...r,
               audit: {
                 isWashed: true,
-                reason: '⚠️ 階段一正則篩選：直接匹配到顯性打卡贈禮交易關鍵字。',
+                reason: '階段一規則分析：匹配到顯性打卡贈送促銷字樣（高頻精確關鍵字）。',
                 confidenceScore: 100,
                 issueType: 'incentive' as const
               }
             };
           }
 
-          // Otherwise, check if processed by Gemini in Stage 2
           if (aiStoreMap[r.username]) {
             return {
               ...r,
@@ -460,11 +490,9 @@ export function Results() {
             };
           }
 
-          // Fallback to local heuristic engine
           return r;
         });
 
-        // Recompute aggregates (with weighted score, no binary hard cut-off!)
         const total = updatedReviews.length;
         let suspicious = 0;
         let originalSum = 0;
@@ -476,7 +504,6 @@ export function Results() {
         updatedReviews.forEach(r => {
           originalSum += r.stars;
 
-          // Compute review weight based on confidence score (no binary hard cut-off!)
           const weight = r.audit.isWashed 
             ? 1 - (r.audit.confidenceScore / 100) 
             : (r.audit.confidenceScore / 100);
@@ -484,7 +511,6 @@ export function Results() {
           weightedSum += r.stars * weight;
           weightTotal += weight;
 
-          // Accumulate weighted star distribution (rounded to 1 decimal to avoid floating point precision leaks)
           filteredDist[r.stars as 1 | 2 | 3 | 4 | 5] = parseFloat(
             ((filteredDist[r.stars as 1 | 2 | 3 | 4 | 5] || 0) + weight).toFixed(1)
           );
@@ -519,115 +545,642 @@ export function Results() {
       setShopResults(updatedResults);
     } catch (e: any) {
       console.error(e);
-      setApiError(`二階段 AI 複審發生錯誤：${e.message || '請確認 API 金鑰是否正確、網路連線或是否開啟跨域訪問限制。'}`);
+      setApiError(e.message || '連線 API 時發生未知錯誤');
     } finally {
       setIsAiAuditing(false);
     }
   };
 
-  // Find best store (highest trust score)
-  const bestStoreIndex = shopResults.reduce((maxIdx, current, idx, arr) =>
-    current.trustScore > arr[maxIdx].trustScore ? idx : maxIdx, 0
-  );
+  const isComplete = shopResults.length > 0 && !isAiAuditing;
+  const showLoader = isAiAuditing;
 
-  return (
-    <div className="min-h-screen bg-[#f5f1e8] py-8 px-4 font-sans selection:bg-[#6b8e7f]/20">
-      <div className="container mx-auto max-w-5xl">
-        {/* Back Button & Title */}
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
-          <motion.button
+  let bestStoreIndex = 0;
+  if (shopResults.length > 0) {
+    let maxRating = -1;
+    shopResults.forEach((shop, idx) => {
+      if (shop.filteredRating > maxRating) {
+        maxRating = shop.filteredRating;
+        bestStoreIndex = idx;
+      }
+    });
+  }
+
+  const toggleCoT = (storeIndex: number, reviewIndex: number) => {
+    const key = `${storeIndex}-${reviewIndex}`;
+    setExpandedCoT(prev => ({
+      ...prev,
+      [key]: !prev[key]
+    }));
+  };
+
+  // Early return while loading to prevent partial flashing
+  if (!isComplete) {
+    return (
+      <div className="min-h-screen bg-[#f5f1e8] flex flex-col font-sans selection:bg-[#6b8e7f]/20">
+        <header className="sticky top-0 z-50 backdrop-blur-md bg-[#f5f1e8]/80 border-b border-[#d4c5b0]/30 px-4 md:px-8 py-3.5 flex items-center justify-between shadow-xs">
+          <div className="flex items-center gap-2.5 cursor-pointer" onClick={() => navigate('/')}>
+            <div className="bg-[#6b8e7f] text-white w-9 h-9 rounded-xl border-2 border-[#4a5d52] font-black text-base shadow-sm flex items-center justify-center">
+              <Shield className="w-5 h-5 text-white" />
+            </div>
+            <span className="font-display font-black text-lg text-[#4a5d52] tracking-tight">
+              疑騙真星 <span className="text-[#6b8e7f] font-sans font-bold text-sm bg-white border border-[#d4c5b0]/60 px-1.5 py-0.5 rounded-md ml-1">TrueRating</span>
+            </span>
+          </div>
+          <button
             onClick={() => navigate('/analyzer')}
-            initial={{ opacity: 0, x: -20 }}
-            animate={{ opacity: 1, x: 0 }}
-            whileHover={{ scale: 1.05 }}
-            whileTap={{ scale: 0.95 }}
-            className="flex items-center gap-2 bg-white px-5 py-2.5 rounded-full shadow-sm border border-[#d4c5b0] text-[#4a5d52] font-semibold cursor-pointer"
+            className="flex items-center gap-1.5 bg-white px-4 py-1.5 rounded-full shadow-xs border border-[#d4c5b0] text-xs font-bold text-[#4a5d52] cursor-pointer"
           >
-            <ArrowLeft className="w-5 h-5 text-[#6b8e7f]" />
-            返回修改對比
-          </motion.button>        </div>
+            <ArrowLeft className="w-4 h-4 text-[#6b8e7f]" />
+            返回修改
+          </button>
+        </header>
 
+        <div className="flex-1 flex flex-col items-center justify-center p-4 md:p-8">
+          {showLoader && shopResults.length > 0 ? (
+            <div className="max-w-5xl w-full grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+              {/* Left Column: Loader */}
+              <div className="lg:col-span-5 flex justify-center">
+                <motion.div
+                  initial={{ opacity: 0, y: -20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="bg-white rounded-[32px] p-6 shadow-md border-2 border-[#6b8e7f] flex flex-col items-center justify-center text-center relative overflow-hidden w-full"
+                >
+                  <div className="absolute left-0 right-0 h-1 bg-[#6b8e7f]/50 top-0 animate-scan shadow-[0_0_10px_#6b8e7f]"></div>
+                  
+                  <Loader2 className="w-10 h-10 animate-spin text-[#6b8e7f] mb-4" />
+                  <h3 className="font-extrabold text-base text-[#4a5d52] mb-1.5 font-display">
+                    雙階段 AI 混合審計進行中...
+                  </h3>
+                  <p className="text-xs text-[#6b8e7f] max-w-xs mb-6 font-medium leading-relaxed">
+                    系統正執行「啟發式正則篩選 ➔ AI 語意矛盾檢索 ➔ 大模型思維鏈推理」，這大約需要數秒。
+                  </p>
 
+                  <div className="w-full space-y-2 bg-[#f5f1e8]/50 p-4 rounded-xl border border-[#d4c5b0]/60 text-left text-xs font-bold text-[#4a5d52]">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[#6b8e7f] font-bold">✓</span>
+                      <span>階段一：本地正則規則匹配</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[#6b8e7f] font-bold">✓</span>
+                      <span>階段一：時間發布異常密度計算</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="relative flex h-2 w-2">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#6b8e7f] opacity-75"></span>
+                        <span className="relative inline-flex rounded-full h-2 w-2 bg-[#6b8e7f]"></span>
+                      </span>
+                      <span className="text-[#6b8e7f]">階段二：調用大語言模型語意複審中...</span>
+                    </div>
+                  </div>
+                </motion.div>
+              </div>
 
-        {/* Global Stats Summary Banner */}
-        <motion.div
-          initial={{ opacity: 0, y: -20 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="bg-white rounded-3xl p-6 shadow-md mb-6 border-2 border-[#d4c5b0]/60 text-center relative overflow-hidden"
-        >
-          <div className="absolute right-0 top-0 translate-x-4 -translate-y-4 w-24 h-24 bg-[#6b8e7f]/10 rounded-full blur-xl"></div>
-          <h1 className="text-2xl md:text-3xl font-extrabold text-[#4a5d52] mb-1">
-            🔍 店家「濾水」對比報告
-          </h1>
-          <p className="text-sm text-[#6b8e7f] font-medium">
-            已成功分析 {shopResults.length} 間店家真實 Google Maps 評論數據集
-          </p>
-        </motion.div>
+              {/* Right Column: Stage 1 Report */}
+              <div className="lg:col-span-7 bg-white rounded-[32px] p-6 shadow-md border border-[#d4c5b0]/60 space-y-5">
+                <h3 className="font-extrabold text-base text-[#4a5d52] border-b border-[#d4c5b0]/40 pb-3 flex items-center gap-2 font-display">
+                  <Database className="w-5 h-5 text-[#6b8e7f]" />
+                  第一階段：本機啟發式規則分析報告 (已完成)
+                </h3>
+                <div className="space-y-4">
+                  {shopResults.map((shop, idx) => {
+                    const reviews = shop.auditedReviews || shop.reviews || [];
+                    const stage1Washed = reviews.filter(r => {
+                      const audit = auditReview(r);
+                      return audit.isWashed && audit.issueType === 'incentive';
+                    });
+                    const stage1Count = stage1Washed.length;
+                    
+                    const ambiguousReviews = reviews.filter(r => {
+                      const isStage1 = stage1Washed.some(s1 => s1.username === r.username && s1.text === r.text);
+                      return r.stars === 5 && !isStage1 && r.text.trim().length > 0;
+                    });
+                    
+                    const aiAuditLimit = (() => {
+                      if (location.state?.aiAuditCount !== undefined) return Number(location.state.aiAuditCount);
+                      const saved = localStorage.getItem('ai_audit_count');
+                      return saved ? Number(saved) : 15;
+                    })();
+                    const stage2Sent = Math.min(ambiguousReviews.length, aiAuditLimit);
+                    
+                    const remainingReviews = reviews.filter(r => !stage1Washed.some(w => w.username === r.username && w.text === r.text));
+                    const heuristicRating = remainingReviews.length > 0
+                      ? Number((remainingReviews.reduce((sum, r) => sum + r.stars, 0) / remainingReviews.length).toFixed(2))
+                      : shop.originalRating;
 
-        {isAiAuditing && (
-          <motion.div
-            initial={{ opacity: 0, y: -20 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="bg-white rounded-3xl p-6 shadow-lg mb-6 border-2 border-[#6b8e7f] flex flex-col items-center justify-center text-center animate-pulse"
-          >
-            <Loader2 className="w-8 h-8 animate-spin text-[#6b8e7f] mb-3" />
-            <h3 className="font-extrabold text-base text-[#4a5d52] mb-1">
-              🔍 雙階段 AI 混合審計進行中...
-            </h3>
-            <p className="text-xs text-[#6b8e7f]">
-              正在執行：階段一正則篩選 ➔ 階段二 AI 語意比對與思維鏈推理，請稍候。
-            </p>
-          </motion.div>
-        )}
+                    return (
+                      <div key={idx} className="bg-[#f5f1e8]/40 p-4 rounded-2xl border border-[#d4c5b0]/60 space-y-4">
+                        <div className="flex flex-col sm:flex-row justify-between sm:items-center gap-2">
+                          <div>
+                            <h4 className="font-extrabold text-[#4a5d52] text-sm flex items-center gap-1.5">
+                              <span className="inline-block w-2.5 h-2.5 rounded-md bg-[#6b8e7f]"></span>
+                              {shop.name}
+                            </h4>
+                            <p className="text-[10px] text-[#6b8e7f] mt-0.5 font-bold">總評論數量：{shop.totalReviews} 則</p>
+                          </div>
+                          
+                          <div className="flex items-center gap-3 bg-white/40 px-3 py-1.5 rounded-xl border border-[#d4c5b0]/20 self-start sm:self-auto">
+                            <div className="text-right">
+                              <div className="text-[9px] text-[#6b8e7f] font-bold">原始評分</div>
+                              <div className="text-xs font-black text-[#4a5d52]/60 line-through">{shop.originalRating.toFixed(1)} ★</div>
+                            </div>
+                            <div className="h-6 w-[1px] bg-[#d4c5b0]/60"></div>
+                            <div className="text-right">
+                              <div className="text-[9px] text-[#6b8e7f] font-bold">一階篩後評分</div>
+                              <div className="text-sm font-black text-[#6b8e7f]">{heuristicRating.toFixed(2)} ★</div>
+                            </div>
+                          </div>
+                        </div>
 
-        {/* Winner Card */}
-        {shopResults.length > 1 && shopResults[bestStoreIndex] && (
-          <motion.div
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            transition={{ delay: 0.1 }}
-            className="bg-gradient-to-r from-[#e8c547] to-[#efd063] rounded-3xl p-6 shadow-md mb-8 border-3 border-[#4a5d52] relative overflow-hidden"
-          >
-            <div className="absolute -right-8 -bottom-8 text-9xl opacity-15 select-none pointer-events-none">🏆</div>
-            <div className="flex items-center gap-4">
-              <div className="text-4xl bg-white p-3 rounded-2xl border-2 border-[#4a5d52] shadow-sm">🏆</div>
-              <div>
-                <div className="text-[#4a5d52] font-black text-xs uppercase tracking-wider mb-1 bg-white/40 px-2 py-0.5 rounded-md inline-block">
-                  經篩選後：最值得信賴的真實星級選擇
-                </div>
-                <div className="text-2xl md:text-3xl font-black text-[#4a5d52]">
-                  {shopResults[bestStoreIndex].storeName}
-                </div>
-                <div className="text-[#4a5d52]/80 text-sm mt-1 font-bold">
-                  真實信任度分數：
-                  <span className="text-lg text-[#4a5d52] font-black">{shopResults[bestStoreIndex].trustScore}</span>
-                  /100 (僅有 {shopResults[bestStoreIndex].suspiciousReviews} 則可疑灌水評論)
+                        {/* Heuristic indicators grid */}
+                        <div className="grid grid-cols-3 gap-2.5 pt-3 border-t border-[#d4c5b0]/30 text-center">
+                          <div className="bg-white/60 p-2 rounded-xl border border-[#d4c5b0]/40">
+                            <div className="text-[9px] text-[#6b8e7f] font-bold">一階正則洗評</div>
+                            <div className="text-xs font-black text-red-500 mt-0.5">{stage1Count} 則</div>
+                          </div>
+                          <div className="bg-white/60 p-2 rounded-xl border border-[#d4c5b0]/40">
+                            <div className="text-[9px] text-[#6b8e7f] font-bold">二階 AI 待審</div>
+                            <div className="text-xs font-black text-amber-500 mt-0.5">{stage2Sent} 則</div>
+                          </div>
+                          <div className="bg-white/60 p-2 rounded-xl border border-[#d4c5b0]/40 flex flex-col justify-center items-center">
+                            <div className="text-[9px] text-[#6b8e7f] font-bold">當前進度</div>
+                            <div className="text-[9px] font-black text-[#6b8e7f] mt-0.5 flex items-center justify-center gap-1">
+                              <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>
+                              AI 審查中
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             </div>
+          ) : (
+            <div className="text-center bg-white p-8 rounded-[32px] border border-[#d4c5b0] max-w-sm shadow-md">
+              <Loader2 className="w-8 h-8 animate-spin text-[#6b8e7f] mx-auto mb-3" />
+              <p className="text-xs text-[#6b8e7f] font-bold">正在讀取評價數據集庫，請稍候...</p>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const gridLayoutClass = shopResults.length === 1 
+    ? 'grid-cols-1 max-w-2xl mx-auto' 
+    : shopResults.length === 2 
+    ? 'grid-cols-1 lg:grid-cols-2 max-w-5xl' 
+    : 'grid-cols-1 lg:grid-cols-3 max-w-7xl';
+
+  return (
+    <div className="min-h-screen bg-[#f5f1e8] font-sans selection:bg-[#6b8e7f]/20 pb-16">
+      {/* Brand Navigation Header */}
+      <header className="sticky top-0 z-50 backdrop-blur-md bg-[#f5f1e8]/80 border-b border-[#d4c5b0]/30 px-4 md:px-8 py-3.5 flex items-center justify-between shadow-xs">
+        <div className="flex items-center gap-2.5 cursor-pointer" onClick={() => navigate('/')}>
+          <div className="bg-[#6b8e7f] text-white w-9 h-9 rounded-xl border-2 border-[#4a5d52] font-black text-base shadow-sm flex items-center justify-center">
+            <Shield className="w-5 h-5 text-white" />
+          </div>
+          <span className="font-display font-black text-lg text-[#4a5d52] tracking-tight">
+            疑騙真星 <span className="text-[#6b8e7f] font-sans font-bold text-sm bg-white border border-[#d4c5b0]/60 px-1.5 py-0.5 rounded-md ml-1">TrueRating</span>
+          </span>
+        </div>
+        <button
+          onClick={() => navigate('/analyzer')}
+          className="flex items-center gap-1.5 bg-white px-4 py-1.5 rounded-full shadow-xs border border-[#d4c5b0] text-xs font-bold text-[#4a5d52] cursor-pointer"
+        >
+          <ArrowLeft className="w-4 h-4 text-[#6b8e7f]" />
+          返回修改
+        </button>
+      </header>
+
+      <div className="container mx-auto px-4 py-8 max-w-7xl">
+        {apiError && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="mb-8 p-4 bg-[#fde8e8] border-3 border-[#e53e3e] text-[#9b2c2c] rounded-2xl shadow-[4px_4px_0px_0px_#9b2c2c] max-w-4xl mx-auto flex items-start gap-3"
+          >
+            <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5 text-[#e53e3e]" />
+            <div className="flex-1 space-y-1">
+              <p className="font-extrabold text-sm font-sans">第二階段 AI 語意審計失敗：</p>
+              <p className="text-xs font-semibold leading-relaxed">{apiError}</p>
+            </div>
+            <button
+              onClick={() => setApiError('')}
+              className="text-[#9b2c2c] hover:opacity-80 font-black cursor-pointer ml-2"
+            >
+              <X className="w-4 h-4" />
+            </button>
           </motion.div>
         )}
+        
+        {/* Sleek Tactile Shop Switcher Navbar */}
+        <motion.div
+          initial={{ opacity: 0, y: -10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="flex flex-wrap gap-2.5 p-2 bg-white rounded-2xl mb-8 border-3 border-[#4a5d52] shadow-tactile max-w-4xl mx-auto justify-center select-none"
+        >
+          <button
+            onClick={() => {
+              setActiveStoreTab('all');
+              setSelectedInspectorTab(0);
+            }}
+            className={`px-4 py-2.5 rounded-xl text-xs md:text-sm font-black transition-all cursor-pointer flex items-center gap-1.5 border-2 active:translate-y-0.5 active:shadow-none ${
+              activeStoreTab === 'all'
+                ? 'bg-[#6b8e7f] text-white border-[#4a5d52] shadow-[2px_2px_0px_0px_#4a5d52]'
+                : 'bg-white text-[#4a5d52] border-[#4a5d52] shadow-[2px_2px_0px_0px_#4a5d52] hover:bg-[#6b8e7f]/10'
+            }`}
+          >
+            <Activity className="w-4 h-4" />
+            全部對比 ({shopResults.length} 間)
+          </button>
+          
+          {shopResults.map((shop, idx) => {
+            const isBest = idx === bestStoreIndex && shopResults.length > 1;
+            return (
+              <button
+                key={idx}
+                onClick={() => {
+                  setActiveStoreTab(idx);
+                  setSelectedInspectorTab(idx);
+                }}
+                className={`px-4 py-2.5 rounded-xl text-xs md:text-sm font-black transition-all cursor-pointer flex items-center gap-2 border-2 active:translate-y-0.5 active:shadow-none ${
+                  activeStoreTab === idx
+                    ? 'bg-[#6b8e7f] text-white border-[#4a5d52] shadow-[2px_2px_0px_0px_#4a5d52]'
+                    : 'bg-white text-[#4a5d52] border-[#4a5d52] shadow-[2px_2px_0px_0px_#4a5d52] hover:bg-[#6b8e7f]/10'
+                }`}
+              >
+                {isBest && <Trophy className="w-3.5 h-3.5 text-[#e8c547] fill-[#e8c547]" />}
+                <span>{cleanStoreName(shop.storeName)} {shop.filteredRating.toFixed(1)}★</span>
+              </button>
+            );
+          })}
+        </motion.div>
 
-        {/* Dispense Slot with Results */}
-        <DispenseSlot isOpen={true}>
-          <div className="space-y-8">
-            {shopResults.map((result, idx) => {
+        {/* Global Synchronized Sub-Metric Switcher */}
+        <div className="flex gap-2 p-1.5 bg-[#f5f1e8] rounded-2xl mb-8 border-2 border-[#4a5d52] max-w-sm mx-auto shadow-[4px_4px_0px_0px_#4a5d52] select-none">
+          <button
+            onClick={() => setActiveSubTab('rating')}
+            className={`flex-1 py-2.5 rounded-xl text-xs font-black transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+              activeSubTab === 'rating'
+                ? 'bg-[#6b8e7f] text-white shadow-[2px_2px_0px_0px_#4a5d52] border-2 border-[#4a5d52]'
+                : 'text-[#6b8e7f] hover:text-[#4a5d52] border-2 border-transparent hover:bg-white/50'
+            }`}
+          >
+            <Star className="w-4 h-4" />
+            評分脫水
+          </button>
+          <button
+            onClick={() => setActiveSubTab('anomalies')}
+            className={`flex-1 py-2.5 rounded-xl text-xs font-black transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+              activeSubTab === 'anomalies'
+                ? 'bg-[#6b8e7f] text-white shadow-[2px_2px_0px_0px_#4a5d52] border-2 border-[#4a5d52]'
+                : 'text-[#6b8e7f] hover:text-[#4a5d52] border-2 border-transparent hover:bg-white/50'
+            }`}
+          >
+            <AlertTriangle className="w-4 h-4" />
+            灌水特徵
+          </button>
+          <button
+            onClick={() => setActiveSubTab('charts')}
+            className={`flex-1 py-2.5 rounded-xl text-xs font-black transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+              activeSubTab === 'charts'
+                ? 'bg-[#6b8e7f] text-white shadow-[2px_2px_0px_0px_#4a5d52] border-2 border-[#4a5d52]'
+                : 'text-[#6b8e7f] hover:text-[#4a5d52] border-2 border-transparent hover:bg-white/50'
+            }`}
+          >
+            <FileText className="w-4 h-4" />
+            星級分布
+          </button>
+        </div>
+
+        {/* Multi-Column Side-by-Side Grid Layout */}
+        <div className={`grid gap-6 ${
+          activeStoreTab === 'all' ? gridLayoutClass : 'grid-cols-1 max-w-2xl mx-auto'
+        }`}>
+          {shopResults
+            .map((result, idx) => ({ result, idx }))
+            .filter(({ idx }) => activeStoreTab === 'all' || activeStoreTab === idx)
+            .map(({ result, idx }) => {
               const isBest = idx === bestStoreIndex && shopResults.length > 1;
               const hasMajorDrop = result.originalRating - result.filteredRating >= 0.3 || result.trustScore < 80;
-              
-              // Prepare chart data for Recharts
-              const distData = [
-                { star: '5★', '原始評價': result.ratingDistribution.original[5] || 0, '濾水真實': result.ratingDistribution.filtered[5] || 0 },
-                { star: '4★', '原始評價': result.ratingDistribution.original[4] || 0, '濾水真實': result.ratingDistribution.filtered[4] || 0 },
-                { star: '3★', '原始評價': result.ratingDistribution.original[3] || 0, '濾水真實': result.ratingDistribution.filtered[3] || 0 },
-                { star: '2★', '原始評價': result.ratingDistribution.original[2] || 0, '濾水真實': result.ratingDistribution.filtered[2] || 0 },
-                { star: '1★', '原始評價': result.ratingDistribution.original[1] || 0, '濾水真實': result.ratingDistribution.filtered[1] || 0 },
-              ];
+            
+            const distData = [
+              { star: '5★', '原始評價': result.ratingDistribution.original[5] || 0, '濾水真實': result.ratingDistribution.filtered[5] || 0 },
+              { star: '4★', '原始評價': result.ratingDistribution.original[4] || 0, '濾水真實': result.ratingDistribution.filtered[4] || 0 },
+              { star: '3★', '原始評價': result.ratingDistribution.original[3] || 0, '濾水真實': result.ratingDistribution.filtered[3] || 0 },
+              { star: '2★', '原始評價': result.ratingDistribution.original[2] || 0, '濾水真實': result.ratingDistribution.filtered[2] || 0 },
+              { star: '1★', '原始評價': result.ratingDistribution.original[1] || 0, '濾水真實': result.ratingDistribution.filtered[1] || 0 },
+            ];
 
-              // Filtering inspection reviews
-              const query = inspectSearch[idx] || '';
-              const filter = inspectFilter[idx] || 'all';
-              const filteredReviews = result.auditedReviews.filter(rev => {
+            return (
+              <motion.div
+                key={idx}
+                initial={{ opacity: 0, y: 15 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.1 + idx * 0.1 }}
+                className={`bg-white rounded-[32px] overflow-hidden border-3 flex flex-col justify-between transition-all duration-300 hover:-translate-y-1 ${
+                  isBest ? 'border-[#e8c547] shadow-[4px_4px_0px_0px_#e8c547] ring-4 ring-[#e8c547]/10' : 'border-[#4a5d52] shadow-[4px_4px_0px_0px_#4a5d52]'
+                }`}
+              >
+                {/* Store Header Banner */}
+                <div className={`px-4.5 py-4 ${
+                  isBest ? 'bg-[#e8c547]' : 'bg-[#6b8e7f]'
+                } border-b-3 border-[#4a5d52] flex items-center justify-between`}>
+                  <div className="truncate">
+                    <h2 className="text-sm md:text-base font-black flex items-center gap-1.5 text-[#4a5d52] font-display truncate">
+                      {isBest && <Trophy className="w-4 h-4 text-[#4a5d52]" />}
+                      {cleanStoreName(result.storeName)}
+                    </h2>
+                    <p className="text-[9px] text-[#4a5d52]/80 font-bold tracking-wider">
+                      載入 {result.totalReviews} 則歷史評論
+                    </p>
+                  </div>
+                  <div className="bg-white/40 border border-[#4a5d52]/60 px-2 py-0.5 rounded-full text-[9px] font-black text-[#4a5d52] shrink-0 ml-1">
+                    {result.trustScore >= 75 ? '安全信譽' : result.trustScore >= 50 ? '警告標記' : '高危洗評'}
+                  </div>
+                </div>
+
+                {/* Body Content - Switched based on activeSubTab with fixed min height */}
+                <div className="p-4.5 space-y-4 flex-1 flex flex-col justify-between min-h-[300px]">
+                  <AnimatePresence mode="wait">
+                    {activeSubTab === 'rating' && (
+                      <motion.div
+                        key="rating"
+                        initial={{ opacity: 0, y: 8 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -8 }}
+                        className="space-y-4 flex-1 flex flex-col justify-between"
+                      >
+                        {/* Rating Drop Visual Flowcard */}
+                        <div className="space-y-3">
+                          <h4 className="text-[10px] font-black text-[#4a5d52] uppercase tracking-wider border-b border-[#d4c5b0]/40 pb-1 flex justify-between items-center font-display">
+                            <span>星級評分脫水流程</span>
+                            {hasMajorDrop && (
+                              <span className="bg-[#d4a5a5] text-[#8c4848] px-1.5 py-0.5 rounded text-[8px] font-sans font-extrabold animate-pulse">
+                                評分水分重
+                              </span>
+                            )}
+                          </h4>
+
+                          <div className="bg-[#f5f1e8]/70 border border-[#d4c5b0]/60 p-2.5 rounded-xl flex items-center justify-around text-center">
+                            <div>
+                              <span className="block text-[8px] text-[#6b8e7f] font-bold">原始</span>
+                              <span className="text-sm font-black text-[#4a5d52]">{result.originalRating.toFixed(2)}★</span>
+                            </div>
+                            <div className="text-xs text-[#d4c5b0] font-black">➔</div>
+                            <div>
+                              <span className="block text-[8px] text-[#8c4848] font-bold">扣減</span>
+                              <span className="text-xs font-black text-[#8c4848]">
+                                -{(result.originalRating - result.filteredRating).toFixed(2)}★
+                              </span>
+                            </div>
+                            <div className="text-xs text-[#d4c5b0] font-black">➔</div>
+                            <div>
+                              <span className="block text-[8px] text-[#6b8e7f] font-bold">真實</span>
+                              <span className="text-sm font-black text-[#6b8e7f]">{result.filteredRating.toFixed(2)}★</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Explanation Text */}
+                        <div className="text-[10px] leading-relaxed text-[#4a5d52] mt-3">
+                          {result.trustScore < 80 ? (
+                            <div className="bg-[#d4a5a5]/10 border border-[#d4a5a5]/25 p-3 rounded-lg text-[#8c4848] font-semibold leading-relaxed">
+                              系統過濾虛假 5 星洗評後，真實得分降至 <b>{result.filteredRating.toFixed(2)}★</b>，存在灌水引導嫌疑。
+                            </div>
+                          ) : (
+                            <div className="bg-[#6b8e7f]/10 border border-[#6b8e7f]/25 p-3 rounded-lg text-[#304a3e] font-semibold leading-relaxed">
+                              評分多為自然就餐生成，無刻意洗評痕跡，真實口碑約 <b>{result.filteredRating.toFixed(2)}★</b>。
+                            </div>
+                          )}
+                        </div>
+                      </motion.div>
+                    )}
+
+                    {activeSubTab === 'anomalies' && (
+                      <motion.div
+                        key="anomalies"
+                        initial={{ opacity: 0, y: 8 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -8 }}
+                        className="space-y-4 flex-1 flex flex-col justify-between"
+                      >
+                        {/* Trust Score Box */}
+                        <div className="bg-[#f5f1e8]/30 rounded-xl p-3.5 border border-[#d4c5b0]/60">
+                          <div className="flex justify-between items-center text-[10px] font-black text-[#6b8e7f] mb-1">
+                            <span className="flex items-center gap-1">
+                              <ShieldCheck className="w-3.5 h-3.5" />
+                              真實信任度分數
+                            </span>
+                            <span className="text-xs font-black text-[#4a5d52]">{result.trustScore}/100</span>
+                          </div>
+                          <div className="w-full bg-[#e8dcc8]/60 h-2.5 rounded-full overflow-hidden mb-1.5">
+                            <div 
+                              className={`h-full rounded-full transition-all duration-500 ${
+                                result.trustScore >= 75 ? 'bg-[#6b8e7f]' : result.trustScore >= 50 ? 'bg-[#e8c547]' : 'bg-[#d4a5a5]'
+                              }`}
+                              style={{ width: `${result.trustScore}%` }}
+                            ></div>
+                          </div>
+                          <p className="text-[9px] text-[#6b8e7f] font-semibold">
+                            偵測到 {result.suspiciousReviews} 則疑似洗評（約佔總數的 {result.totalReviews > 0 ? ((result.suspiciousReviews / result.totalReviews) * 100).toFixed(0) : 0}%）
+                          </p>
+                        </div>
+
+                        {/* Feature anomaly list */}
+                        <div className="space-y-2">
+                          <span className="block text-[8px] text-[#6b8e7f] font-bold uppercase tracking-wider">
+                            洗評異常特徵計數：
+                          </span>
+                          <div className="grid grid-cols-3 gap-2">
+                            <div className="bg-white rounded-lg p-2.5 border border-[#d4c5b0]/60 text-center shadow-2xs">
+                              <span className="block text-sm font-black text-[#8c4848]">{result.issues.timeAnomaly}</span>
+                              <span className="text-[8px] text-[#6b8e7f] font-bold">打卡促銷</span>
+                            </div>
+                            <div className="bg-white rounded-lg p-2.5 border border-[#d4c5b0]/60 text-center shadow-2xs">
+                              <span className="block text-sm font-black text-[#8b7534]">{result.issues.templateText}</span>
+                              <span className="text-[8px] text-[#6b8e7f] font-bold">極短模版</span>
+                            </div>
+                            <div className="bg-white rounded-lg p-2.5 border border-[#d4c5b0]/60 text-center shadow-2xs">
+                              <span className="block text-sm font-black text-[#6b8e7f]">{result.issues.vague}</span>
+                              <span className="text-[8px] text-[#6b8e7f] font-bold">語意衝突</span>
+                            </div>
+                          </div>
+                        </div>
+                      </motion.div>
+                    )}
+
+                    {activeSubTab === 'charts' && (
+                      <motion.div
+                        key="charts"
+                        initial={{ opacity: 0, y: 8 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -8 }}
+                        className="space-y-4 flex-1 flex flex-col justify-center"
+                      >
+                        {/* Star Distribution chart */}
+                        <div className="bg-white rounded-xl p-2.5 border border-[#e8dcc8]">
+                          <h5 className="text-[9px] font-black text-[#4a5d52] uppercase tracking-wider mb-2 font-display">
+                            星級分佈對比（原始 vs 濾水）
+                          </h5>
+                          <div className="h-44 w-full">
+                            <ResponsiveContainer width="100%" height="100%">
+                              <BarChart data={distData} margin={{ top: 5, right: 5, left: -32, bottom: 5 }}>
+                                <defs>
+                                  <linearGradient id={`colorOriginal-${idx}`} x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="5%" stopColor="#e8c547" stopOpacity={0.95}/>
+                                    <stop offset="95%" stopColor="#d5b22b" stopOpacity={0.6}/>
+                                  </linearGradient>
+                                  <linearGradient id={`colorFiltered-${idx}`} x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="5%" stopColor="#6b8e7f" stopOpacity={0.95}/>
+                                    <stop offset="95%" stopColor="#4a5d52" stopOpacity={0.6}/>
+                                  </linearGradient>
+                                </defs>
+                                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e8dcc8" />
+                                <XAxis dataKey="star" tick={{ fontSize: 8, fill: '#4a5d52', fontWeight: 'bold' }} stroke="#d4c5b0" />
+                                <YAxis tick={{ fontSize: 8, fill: '#4a5d52' }} stroke="#d4c5b0" />
+                                <Tooltip 
+                                  contentStyle={{ backgroundColor: 'white', borderRadius: '10px', border: '1.5px solid #d4c5b0', fontSize: '9px', fontWeight: 'bold' }}
+                                />
+                                <Bar dataKey="原始評價" fill={`url(#colorOriginal-${idx})`} radius={[3, 3, 0, 0]} />
+                                <Bar dataKey="濾水真實" fill={`url(#colorFiltered-${idx})`} radius={[3, 3, 0, 0]} />
+                              </BarChart>
+                            </ResponsiveContainer>
+                          </div>
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+
+              </motion.div>
+            );
+          })}
+        </div>
+
+        {/* Tabbed Detailed Review Inspector (Bottom Layout Card) */}
+        {shopResults.length > 0 && shopResults[selectedInspectorTab] && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.3 }}
+            className="bg-white rounded-[32px] border-3 border-[#4a5d52] shadow-tactile overflow-hidden mt-10 max-w-5xl mx-auto"
+          >
+            {/* Inspector Navigation Header & Tabs */}
+            <div className="bg-[#f5f1e8] p-5 border-b-3 border-[#4a5d52] flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div className="space-y-1.5">
+                <span className="text-xs font-black text-[#4a5d52] uppercase tracking-wider flex items-center gap-1.5 font-display">
+                  <Search className="w-4 h-4 text-[#6b8e7f]" />
+                  店家歷史評價內容透視與審計日誌
+                </span>
+                {/* Store selection tabs */}
+                <div className="flex flex-wrap gap-1.5 pt-1">
+                  {shopResults.map((shop, sIdx) => (
+                    <button
+                      key={sIdx}
+                      onClick={() => setSelectedInspectorTab(sIdx)}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-black transition-all cursor-pointer active:translate-y-0.5 active:shadow-none ${
+                        selectedInspectorTab === sIdx
+                          ? 'bg-[#6b8e7f] text-white shadow-[2px_2px_0px_0px_#4a5d52] border-2 border-[#4a5d52]'
+                          : 'bg-white text-[#4a5d52] border-2 border-[#4a5d52] shadow-[2px_2px_0px_0px_#4a5d52] hover:bg-[#6b8e7f]/10 hover:-translate-y-0.5'
+                      }`}
+                    >
+                      {cleanStoreName(shop.storeName)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Inspector query filters */}
+              {(() => {
+                const result = shopResults[selectedInspectorTab];
+                return (
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={inspectSearch[selectedInspectorTab] || ''}
+                      onChange={(e) => {
+                        const newSearch = { ...inspectSearch };
+                        newSearch[selectedInspectorTab] = e.target.value;
+                        setInspectSearch(newSearch);
+                      }}
+                      placeholder="搜尋評論關鍵字..."
+                      className="px-3 py-1 bg-white rounded-lg border border-[#d4c5b0] text-[11px] text-[#4a5d52] focus:outline-none focus:border-[#6b8e7f] placeholder-[#a0b3a0] w-36 shadow-xs font-semibold"
+                    />
+
+                    <select
+                      value={inspectFilter[selectedInspectorTab] || 'all'}
+                      onChange={(e) => {
+                        const newFilters = { ...inspectFilter };
+                        newFilters[selectedInspectorTab] = e.target.value as 'all' | 'washed' | 'clean';
+                        setInspectFilter(newFilters);
+                      }}
+                      className="bg-white border border-[#d4c5b0] rounded-lg px-2 py-1 text-[11px] font-extrabold text-[#4a5d52] shadow-xs cursor-pointer"
+                    >
+                      <option value="all">顯示全部 ({result.totalReviews})</option>
+                      <option value="washed">僅看灌水 ({result.suspiciousReviews})</option>
+                      <option value="clean">僅看真實 ({result.totalReviews - result.suspiciousReviews})\</option>
+                    </select>
+                  </div>
+                );
+              })()}
+            </div>
+
+            {/* Pipeline Logs display matching the selected store */}
+            {(() => {
+              const activeShop = shopResults[selectedInspectorTab];
+              const storeLog = pipelineLogs.find(log => log.storeName === activeShop.storeName);
+              if (!storeLog) return null;
+              return (
+                <div className="bg-[#f5f1e8]/60 p-4 border-b border-[#d4c5b0]/40 text-[11px] text-[#4a5d52] space-y-2">
+                  <span className="font-extrabold text-[#4a5d52] uppercase tracking-wider block font-display">
+                    {cleanStoreName(activeShop.storeName)} 雙階段審計流水線日誌
+                  </span>
+                  
+                  <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3 pt-1">
+                    <div className="flex-1 bg-white border border-[#d4c5b0]/60 p-2.5 rounded-lg flex justify-between items-center shadow-xs">
+                      <span className="text-[#6b8e7f] font-bold">1. 歷史載入</span>
+                      <span className="font-black text-[#4a5d52]">{storeLog.totalReviews} 則</span>
+                    </div>
+
+                    <div className="text-center font-bold text-[#d4c5b0] text-[10px] md:block hidden">➔</div>
+                    <div className="text-center font-bold text-[#d4c5b0] text-[10px] md:hidden block">▼</div>
+
+                    <div className="flex-1 bg-[#d4a5a5]/10 border border-[#d4a5a5]/30 p-2.5 rounded-lg flex justify-between items-center text-[#8c4848] shadow-xs">
+                      <span className="font-bold flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-[#8c4848] animate-pulse"></span>
+                        2. 規則攔截
+                      </span>
+                      <span className="font-black">{storeLog.stage1Count} 則</span>
+                    </div>
+
+                    <div className="text-center font-bold text-[#d4c5b0] text-[10px] md:block hidden">➔</div>
+                    <div className="text-center font-bold text-[#d4c5b0] text-[10px] md:hidden block">▼</div>
+
+                    <div className="flex-1 bg-white border border-[#d4c5b0]/60 p-2.5 rounded-lg flex justify-between items-center shadow-xs">
+                      <span className="font-bold text-[#6b8e7f]">3. AI 語意複審</span>
+                      <div className="flex gap-1.5 items-center font-black">
+                        <span>送 {storeLog.stage2Sent} 則</span>
+                        {storeLog.stage2Sent > 0 && (
+                          <span className="text-[9px] bg-[#d4a5a5]/20 text-[#8c4848] px-1 py-0.5 rounded font-black">
+                            洗評:{storeLog.stage2Flagged}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Scrollable list of reviews of the selected store */}
+            {(() => {
+              const activeShop = shopResults[selectedInspectorTab];
+              const query = inspectSearch[selectedInspectorTab] || '';
+              const filter = inspectFilter[selectedInspectorTab] || 'all';
+              
+              const filteredReviews = activeShop.auditedReviews.filter(rev => {
                 const textMatch = rev.text.toLowerCase().includes(query.toLowerCase()) || rev.username.toLowerCase().includes(query.toLowerCase());
                 if (!textMatch) return false;
 
@@ -637,385 +1190,178 @@ export function Results() {
               });
 
               return (
-                <motion.div
-                  key={idx}
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: 0.2 + idx * 0.1 }}
-                  className={`bg-white rounded-3xl shadow-lg overflow-hidden border-3 transition-all duration-300 ${
-                    isBest ? 'border-[#e8c547] ring-4 ring-[#e8c547]/20' : 'border-[#d4c5b0]/70'
-                  }`}
-                >
-                  {/* Store Header Banner */}
-                  <div className={`px-6 py-5 ${
-                    isBest ? 'bg-[#e8c547]' : 'bg-[#6b8e7f]'
-                  } border-b-3 border-[#4a5d52] flex items-center justify-between`}>
-                    <div>
-                      <h2 className="text-xl md:text-2xl font-black mb-0.5 flex items-center gap-2 text-[#4a5d52]">
-                        {isBest && <span>🏆</span>}
-                        {result.storeName}
-                      </h2>
-                      <p className="text-xs text-[#4a5d52]/80 font-bold uppercase tracking-wider">
-                        共 {result.totalReviews} 則歷史評價載入分析
-                      </p>
+                <div className="divide-y divide-[#f5f1e8] max-h-96 overflow-y-auto bg-white p-2">
+                  {filteredReviews.length === 0 ? (
+                    <div className="text-center py-12 text-xs text-[#6b8e7f] font-bold">
+                      無符合篩選或關鍵字搜尋條件的評價內容。
                     </div>
-                    <div className="bg-white/40 border border-[#4a5d52]/60 px-3 py-1 rounded-full text-xs font-black text-[#4a5d52]">
-                      {result.trustScore >= 70 ? '🟢 安全信譽' : result.trustScore >= 50 ? '🟡 警告標記' : '🔴 高危洗評'}
-                    </div>
-                  </div>
+                  ) : (
+                    filteredReviews.map((review, rIdx) => {
+                      const isWashed = review.audit.isWashed;
+                      const hasCoT = !!review.audit.reasoningPath;
+                      const cotExpanded = expandedCoT[`${selectedInspectorTab}-${rIdx}`];
 
-                  {/* Body Content */}
-                  <div className="p-5 md:p-6 space-y-6">
-                    {/* Stat boxes row */}
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                      {/* Trust score box */}
-                      <div className={`rounded-2xl p-4 border-2 flex flex-col justify-between ${
-                        result.trustScore >= 70
-                          ? 'bg-[#d4e8d4]/60 border-[#6b8e7f]'
-                          : result.trustScore >= 50
-                          ? 'bg-[#f5ead4]/60 border-[#e8c547]'
-                          : 'bg-[#f5d4d4]/60 border-[#d4a5a5]'
-                      }`}>
-                        <span className="text-xs font-bold text-[#6b8e7f] flex items-center gap-1">
-                          <ShieldCheck className="w-3.5 h-3.5" />
-                          綜合真實信任度
-                        </span>
-                        <div className="mt-2">
-                          <span className={`text-4xl font-black ${
-                            result.trustScore >= 70
-                              ? 'text-[#4a5d52]'
-                              : result.trustScore >= 50
-                              ? 'text-[#8b7534]'
-                              : 'text-[#8b5a5a]'
-                          }`}>{result.trustScore}%</span>
-                          <span className="text-xs text-[#6b8e7f] block mt-1">越接近 100% 越乾淨真實</span>
-                        </div>
-                      </div>
-
-                      {/* Suspicious count box */}
-                      <div className="bg-[#f5d4d4]/40 border-2 border-[#d4a5a5] rounded-2xl p-4 flex flex-col justify-between">
-                        <span className="text-xs font-bold text-[#8c4848] flex items-center gap-1">
-                          <AlertTriangle className="w-3.5 h-3.5" />
-                          抓出灌水評價數
-                        </span>
-                        <div className="mt-2">
-                          <span className="text-4xl font-black text-[#8b5a5a]">{result.suspiciousReviews} 則</span>
-                          <span className="text-xs text-[#8c4848] block mt-1">
-                            佔總評價的 {((result.suspiciousReviews / result.totalReviews) * 100).toFixed(0)}%
-                          </span>
-                        </div>
-                      </div>
-
-                      {/* Issues Box */}
-                      <div className="bg-[#f5f1e8] border-2 border-[#e8dcc8] rounded-2xl p-4 flex flex-col justify-between">
-                        <span className="text-xs font-bold text-[#4a5d52] flex items-center gap-1">
-                          <FileText className="w-3.5 h-3.5" />
-                          洗評異常特徵
-                        </span>
-                        <div className="mt-2 grid grid-cols-3 gap-1 text-center">
-                          <div className="bg-white/60 rounded-lg p-1 border border-[#e8dcc8]">
-                            <span className="block text-sm font-black text-[#8b5a5a]">{result.issues.timeAnomaly}</span>
-                            <span className="text-[9px] text-[#6b8e7f] font-bold">打卡送禮</span>
-                          </div>
-                          <div className="bg-white/60 rounded-lg p-1 border border-[#e8dcc8]">
-                            <span className="block text-sm font-black text-[#8b7534]">{result.issues.templateText}</span>
-                            <span className="text-[9px] text-[#6b8e7f] font-bold">極短模板</span>
-                          </div>
-                          <div className="bg-white/60 rounded-lg p-1 border border-[#e8dcc8]">
-                            <span className="block text-sm font-black text-[#6b8e7f]">{result.issues.vague}</span>
-                            <span className="text-[9px] text-[#6b8e7f] font-bold">語意矛盾</span>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Stars Comparison box */}
-                    <div className="bg-[#f5f1e8]/60 border-2 border-[#e8dcc8] rounded-2xl p-4">
-                      <h4 className="text-xs font-extrabold text-[#4a5d52] uppercase tracking-wider mb-3 border-b border-[#e8dcc8] pb-1.5 flex justify-between items-center">
-                        <span>⭐ 星級評分脫水對比</span>
-                        {hasMajorDrop && (
-                          <span className="bg-[#d4a5a5] text-white px-2 py-0.5 rounded text-[10px] animate-pulse">
-                            ⚠️ 評分水分極重
-                          </span>
-                        )}
-                      </h4>
-
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                        {/* Rating Numbers */}
-                        <div className="flex items-center justify-around bg-white p-4 rounded-xl border border-[#e8dcc8]">
-                          <div className="text-center">
-                            <span className="text-xs font-bold text-[#6b8e7f] block mb-1">原始評分</span>
-                            <span className="text-3xl font-black text-[#4a5d52]">{result.originalRating.toFixed(2)}</span>
-                            <div className="flex justify-center text-xs mt-1">
-                              {Array.from({ length: 5 }).map((_, i) => (
-                                <span key={i} className={i < Math.round(result.originalRating) ? 'text-[#e8c547]' : 'text-[#d4c5b0]'}>★</span>
-                              ))}
-                            </div>
-                          </div>
-                          
-                          <div className="h-10 w-0.5 bg-[#e8dcc8]"></div>
-
-                          <div className="text-center">
-                            <span className="text-xs font-bold text-[#6b8e7f] block mb-1">真實有機評分</span>
-                            <span className="text-3xl font-black text-[#6b8e7f]">{result.filteredRating.toFixed(2)}</span>
-                            <div className="flex justify-center text-xs mt-1">
-                              {Array.from({ length: 5 }).map((_, i) => (
-                                <span key={i} className={i < Math.round(result.filteredRating) ? 'text-[#6b8e7f]' : 'text-[#d4c5b0]'}>★</span>
-                              ))}
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Text explanation */}
-                        <div className="flex flex-col justify-center text-xs text-[#4a5d52]">
-                          {result.trustScore < 80 ? (
-                            <div className="bg-[#d4a5a5]/10 border border-[#d4a5a5]/30 rounded-xl p-3 text-[#8c4848] font-medium leading-relaxed">
-                              ⚠️ <b>水軍灌水警報：</b>該店真實信任度僅有 <b>{result.trustScore}%</b>。系統已鎖定 <b>{result.suspiciousReviews}</b> 則疑似打卡贈送或極短模版之灌水五星評論，已對應扣減評分水分（脫水真實得分約為 <b>{result.filteredRating.toFixed(2)}★</b>）。
-                            </div>
-                          ) : (
-                            <div className="bg-[#6b8e7f]/10 border border-[#6b8e7f]/30 rounded-xl p-3 text-[#304a3e] font-medium leading-relaxed">
-                              ✅ <b>信譽優良：</b>該店真實信任度達 <b>{result.trustScore}%</b>，無明顯系統性灌水行徑，真實口碑約 <b>{result.filteredRating.toFixed(2)}★</b>，評價皆為自然就餐真實反饋。
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Star Distribution comparative chart (Recharts) */}
-                    <div className="bg-white rounded-2xl p-4 border border-[#e8dcc8]">
-                      <h4 className="text-xs font-extrabold text-[#4a5d52] uppercase tracking-wider mb-2">
-                        📊 原始評價 vs 濾水真實評價：星級分佈對照圖
-                      </h4>
-                      <p className="text-[10px] text-[#6b8e7f] mb-3">
-                        *過濾洗評後，虛假的 5 星將被剝除，還原店家真實的「沙丘曲線」（J-Curve / 鐘形真實分佈）。
-                      </p>
-                      
-                      <div className="h-52 w-full">
-                        <ResponsiveContainer width="100%" height="100%">
-                          <BarChart data={distData} margin={{ top: 5, right: 10, left: -25, bottom: 5 }}>
-                            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e8dcc8" />
-                            <XAxis dataKey="star" tick={{ fontSize: 10, fill: '#4a5d52', fontWeight: 'bold' }} stroke="#d4c5b0" />
-                            <YAxis tick={{ fontSize: 10, fill: '#4a5d52' }} stroke="#d4c5b0" />
-                            <Tooltip 
-                              contentStyle={{ backgroundColor: 'white', borderRadius: '12px', border: '2px border #d4c5b0', fontSize: '12px' }}
-                            />
-                            <Bar dataKey="原始評價" fill="#e8c547" radius={[4, 4, 0, 0]} />
-                            <Bar dataKey="濾水真實" fill="#6b8e7f" radius={[4, 4, 0, 0]} />
-                          </BarChart>
-                        </ResponsiveContainer>
-                      </div>
-                      <div className="flex justify-center gap-4 text-xs font-bold mt-2">
-                        <span className="flex items-center gap-1.5"><span className="w-3 h-3 bg-[#e8c547] rounded-sm"></span>原始評分分佈</span>
-                        <span className="flex items-center gap-1.5"><span className="w-3 h-3 bg-[#6b8e7f] rounded-sm"></span>真實有機評分分佈</span>
-                      </div>
-                    </div>
-
-                    {/* Integrated Two-Stage Audit Pipeline Log */}
-                    {(() => {
-                      const storeLog = pipelineLogs.find(log => log.storeName === result.storeName);
-                      if (!storeLog) return null;
                       return (
-                        <div className="bg-[#f5f1e8] border-2 border-[#d4c5b0] rounded-2xl p-4 text-xs text-[#4a5d52] space-y-3">
-                          <h4 className="text-xs font-extrabold text-[#4a5d52] uppercase tracking-wider mb-1 flex items-center gap-1.5">
-                            <Activity className="w-4.5 h-4.5 text-[#6b8e7f]" />
-                            🛡️ 雙階段混合審計流水線日誌 (Two-Stage Hybrid Audit Pipeline Log)
-                          </h4>
+                        <div key={rIdx} className="p-3 text-[11px] flex flex-col gap-2 hover:bg-[#f5f1e8]/30 rounded-xl transition-colors">
+                          <div className="flex items-center justify-between">
+                            <span className="font-extrabold text-[#4a5d52]">{review.username}</span>
+                            <div className="flex items-center gap-2">
+                              <span className="text-[#6b8e7f] text-[9px] font-medium">{review.time}</span>
+                              <span className="font-bold text-[#e8c547] bg-[#e8c547]/10 px-2 py-0.5 rounded-full border border-[#e8c547]/30 text-[9px]">
+                                ★ {review.stars}
+                              </span>
+                            </div>
+                          </div>
+                          <p className="text-[#4a5d52] leading-relaxed whitespace-pre-wrap font-medium">{review.text}</p>
                           
-                          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                            {/* Total Input */}
-                            <div className="bg-white border border-[#d4c5b0] p-3 rounded-xl flex flex-col justify-between">
-                              <span className="text-[#6b8e7f] font-bold block mb-1">1. 歷史資料載入</span>
-                              <span className="text-base font-black text-[#4a5d52]">{storeLog.totalReviews} 則評論</span>
-                            </div>
-
-                            {/* Stage 1: Regex */}
-                            <div className="bg-[#d4a5a5]/10 border border-[#d4a5a5]/30 p-3 rounded-xl flex flex-col justify-between text-[#8c4848]">
-                              <span className="font-bold block mb-1 flex items-center gap-1">
-                                <span className="w-2 h-2 rounded-full bg-[#8c4848]"></span>
-                                階段一：啟發式過濾
-                              </span>
-                              <span className="text-base font-black">已攔截 {storeLog.stage1Count} 則</span>
-                            </div>
-
-                            {/* Stage 2: Gemini */}
-                            <div className="bg-white border border-[#d4c5b0] p-3 rounded-xl flex flex-col justify-between">
-                              <span className="font-bold block mb-1 flex items-center gap-1">
-                                <span className="w-2 h-2 rounded-full bg-[#6b8e7f]"></span>
-                                階段二：深度 AI 語意
-                              </span>
-                              <div className="flex justify-between items-center">
-                                <span className="text-sm font-extrabold text-[#4a5d52]">送審 {storeLog.stage2Sent} 則</span>
-                                {storeLog.stage2Sent > 0 && (
-                                  <div className="flex gap-1.5 text-[10px]">
-                                    <span className="bg-[#d4a5a5]/20 text-[#8c4848] px-1.5 py-0.5 rounded font-bold">
-                                      洗評:{storeLog.stage2Flagged}
-                                    </span>
-                                    <span className="bg-[#6b8e7f]/20 text-[#304a3e] px-1.5 py-0.5 rounded font-bold">
-                                      真實:{storeLog.stage2Passed}
-                                    </span>
-                                  </div>
-                                )}
+                          {/* Audit Status Box */}
+                          {isWashed ? (
+                            <div className="bg-[#d4a5a5]/10 border border-[#d4a5a5]/30 p-3 rounded-xl text-[11px] text-[#8c4848] space-y-2">
+                              <div className="flex items-start gap-1.5 font-bold">
+                                <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#8c4848]" />
+                                <span>判定：灌水洗評 ({review.audit.confidenceScore}% 信心度)</span>
                               </div>
-                            </div>
-                          </div>
-
-                          <p className="text-[10px] text-[#6b8e7f] italic leading-tight pt-1">
-                            * 本系統採用兩階段流水線分工：階段一以本地正則和規則引擎快速攔截顯性打卡（0 Token 消耗，保護隱私）；階段二調用 {auditModel === 'gemini' ? 'Gemini 2.5 Flash 雲端 API' : '本地 Gemma 4:e4b 模型'} 對剩餘的模糊 5 星好評進行語意複審與思維鏈推理。
-                          </p>
-                        </div>
-                      );
-                    })()}
-
-                    {/* Detailed Review Inspector */}
-                    <div className="bg-white rounded-2xl border border-[#d4c5b0] overflow-hidden">
-                      {/* Inspector Header */}
-                      <div className="bg-[#f5f1e8] p-4 border-b border-[#d4c5b0] flex flex-col md:flex-row md:items-center justify-between gap-3">
-                        <span className="text-xs font-extrabold text-[#4a5d52] uppercase tracking-wider flex items-center gap-1.5">
-                          <Search className="w-4 h-4 text-[#6b8e7f]" />
-                          🔍 歷史評價內容透視與審計日誌
-                        </span>
-
-                        {/* Search input in inspector */}
-                        <div className="flex gap-2">
-                          <input
-                            type="text"
-                            value={inspectSearch[idx] || ''}
-                            onChange={(e) => {
-                              const newSearch = { ...inspectSearch };
-                              newSearch[idx] = e.target.value;
-                              setInspectSearch(newSearch);
-                            }}
-                            placeholder="搜尋評價關鍵字或帳號..."
-                            className="px-3 py-1 bg-white rounded-lg border border-[#d4c5b0] text-xs text-[#4a5d52] focus:outline-none focus:border-[#6b8e7f] placeholder-[#a0b3a0] w-44"
-                          />
-
-                          {/* Filter select */}
-                          <select
-                            value={inspectFilter[idx] || 'all'}
-                            onChange={(e) => {
-                              const newFilters = { ...inspectFilter };
-                              newFilters[idx] = e.target.value as 'all' | 'washed' | 'clean';
-                              setInspectFilter(newFilters);
-                            }}
-                            className="bg-white border border-[#d4c5b0] rounded-lg px-2 py-1 text-xs font-bold text-[#4a5d52]"
-                          >
-                            <option value="all">顯示全部 ({result.totalReviews})</option>
-                            <option value="washed">⚠️ 僅看灌水 ({result.suspiciousReviews})</option>
-                            <option value="clean">✅ 僅看真實 ({result.totalReviews - result.suspiciousReviews})</option>
-                          </select>
-                        </div>
-                      </div>
-
-                      {/* Scrollable list */}
-                      <div className="divide-y divide-[#f5f1e8] max-h-72 overflow-y-auto bg-white p-2">
-                        {filteredReviews.length === 0 ? (
-                          <div className="text-center py-8 text-xs text-[#6b8e7f] font-bold">
-                            無符合搜尋條件的評價內容。
-                          </div>
-                        ) : (
-                          filteredReviews.map((review, rIdx) => (
-                            <div key={rIdx} className="p-3 text-xs flex flex-col gap-2 hover:bg-[#f5f1e8]/30 rounded-xl transition-colors">
-                              <div className="flex items-center justify-between">
-                                <span className="font-bold text-[#4a5d52]">{review.username}</span>
-                                <div className="flex items-center gap-2">
-                                  <span className="text-[#6b8e7f] text-[10px]">{review.time}</span>
-                                  <span className="font-bold text-[#e8c547] bg-[#e8c547]/10 px-2 py-0.5 rounded-full border border-[#e8c547]/30">
-                                    ★ {review.stars}
-                                  </span>
-                                </div>
+                              <div className="font-semibold opacity-90 pl-5 leading-relaxed">
+                                <b>原因：</b>{review.audit.reason}
                               </div>
-                              <p className="text-[#4a5d52] leading-relaxed whitespace-pre-wrap">{review.text}</p>
-                              
-                              {/* Audit Status Box */}
-                              {review.audit.isWashed ? (
-                                <div className="bg-[#d4a5a5]/10 border border-[#d4a5a5]/30 p-3 rounded-xl text-xs text-[#8c4848] space-y-2">
-                                  <div className="flex items-start gap-1.5 font-bold">
-                                    <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#8c4848]" />
-                                    <span>判定：灌水洗評 ({review.audit.confidenceScore}% 信心度)</span>
-                                  </div>
-                                  <div className="text-[11px] font-medium opacity-90 pl-5 leading-relaxed">
-                                    <b>原因：</b>{review.audit.reason}
-                                  </div>
-                                  {review.audit.reasoningPath && (
-                                    <div className="mt-2 pt-2 border-t border-[#d4a5a5]/20 pl-5 text-[10px] space-y-2">
-                                      <div className="text-[#8c4848]/90 leading-relaxed bg-[#f5f1e8]/60 p-2 rounded-lg italic border border-[#d4c5b0]/30">
-                                        <b>💡 AI 思考鏈 (CoT)：</b>{review.audit.reasoningPath}
-                                      </div>
-                                      <div className="grid grid-cols-3 gap-2 text-[9px] text-center pt-1 font-bold">
-                                        <div className="bg-[#d4a5a5]/20 py-1 px-1.5 rounded">
-                                          利益誘因: <span className="text-[#8c4848] font-black">{review.audit.incentiveIntensity}/5</span>
+
+                              {/* Accordion Reasoning Path */}
+                              {hasCoT && (
+                                <div className="mt-2 pt-2 border-t border-[#d4a5a5]/20">
+                                  <button
+                                    onClick={() => toggleCoT(selectedInspectorTab, rIdx)}
+                                    className="flex items-center justify-between w-full text-left text-[10px] font-bold text-[#8c4848] bg-[#f5f1e8]/40 hover:bg-[#f5f1e8]/80 px-2.5 py-1.5 rounded-lg border border-[#d4c5b0]/30 transition-colors cursor-pointer"
+                                  >
+                                    <span className="flex items-center gap-1.5">
+                                      <span>AI 思考鏈 (CoT 推理)</span>
+                                    </span>
+                                    {cotExpanded ? (
+                                      <ChevronUp className="w-3.5 h-3.5 text-[#8c4848]" />
+                                    ) : (
+                                      <ChevronDown className="w-3.5 h-3.5 text-[#8c4848]" />
+                                    )}
+                                  </button>
+
+                                  <AnimatePresence initial={false}>
+                                    {cotExpanded && (
+                                      <motion.div
+                                        initial={{ height: 0, opacity: 0 }}
+                                        animate={{ height: 'auto', opacity: 1 }}
+                                        exit={{ height: 0, opacity: 0 }}
+                                        transition={{ duration: 0.2 }}
+                                        className="overflow-hidden"
+                                      >
+                                        <div className="mt-2 pl-2 text-[10px] space-y-2">
+                                          <div className="text-[#8c4848]/90 leading-relaxed bg-[#f5f1e8]/60 p-2.5 rounded-lg italic border border-[#d4c5b0]/30">
+                                            <b>推理過程：</b>{review.audit.reasoningPath}
+                                          </div>
+                                          <div className="grid grid-cols-3 gap-2 text-[9px] text-center pt-1 font-bold">
+                                            <div className="bg-[#d4a5a5]/20 py-1 px-1.5 rounded">
+                                              利益誘因: <span className="text-[#8c4848] font-black">{review.audit.incentiveIntensity}/5</span>
+                                            </div>
+                                            <div className="bg-[#d4a5a5]/20 py-1 px-1.5 rounded">
+                                              情感真實: <span className="text-[#8c4848] font-black">{review.audit.sentimentAuthenticity}/5</span>
+                                            </div>
+                                            <div className="bg-[#d4a5a5]/20 py-1 px-1.5 rounded">
+                                              描述細緻: <span className="text-[#8c4848] font-black">{review.audit.descriptionGranularity}/5</span>
+                                            </div>
+                                          </div>
                                         </div>
-                                        <div className="bg-[#d4a5a5]/20 py-1 px-1.5 rounded">
-                                          情感真實: <span className="text-[#8c4848] font-black">{review.audit.sentimentAuthenticity}/5</span>
-                                        </div>
-                                        <div className="bg-[#d4a5a5]/20 py-1 px-1.5 rounded">
-                                          描述細緻: <span className="text-[#8c4848] font-black">{review.audit.descriptionGranularity}/5</span>
-                                        </div>
-                                      </div>
-                                    </div>
-                                  )}
-                                </div>
-                              ) : (
-                                <div className="bg-[#6b8e7f]/10 border border-[#6b8e7f]/30 p-3 rounded-xl text-xs text-[#304a3e] space-y-2">
-                                  <div className="flex items-start gap-1.5 font-bold">
-                                    <Check className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#6b8e7f]" />
-                                    <span>判定：真實評論 ({review.audit.confidenceScore}% 信心度)</span>
-                                  </div>
-                                  <div className="text-[11px] font-medium opacity-90 pl-5 leading-relaxed">
-                                    <b>原因：</b>{review.audit.reason}
-                                  </div>
-                                  {review.audit.reasoningPath && (
-                                    <div className="mt-2 pt-2 border-t border-[#6b8e7f]/20 pl-5 text-[10px] space-y-2">
-                                      <div className="text-[#304a3e]/90 leading-relaxed bg-[#f5f1e8]/60 p-2 rounded-lg italic border border-[#d4c5b0]/30">
-                                        <b>💡 AI 思考鏈 (CoT)：</b>{review.audit.reasoningPath}
-                                      </div>
-                                      <div className="grid grid-cols-3 gap-2 text-[9px] text-center pt-1 font-bold">
-                                        <div className="bg-[#6b8e7f]/20 py-1 px-1.5 rounded">
-                                          利益誘因: <span className="text-[#304a3e] font-black">{review.audit.incentiveIntensity}/5</span>
-                                        </div>
-                                        <div className="bg-[#6b8e7f]/20 py-1 px-1.5 rounded">
-                                          情感真實: <span className="text-[#304a3e] font-black">{review.audit.sentimentAuthenticity}/5</span>
-                                        </div>
-                                        <div className="bg-[#6b8e7f]/20 py-1 px-1.5 rounded">
-                                          描述細緻: <span className="text-[#304a3e] font-black">{review.audit.descriptionGranularity}/5</span>
-                                        </div>
-                                      </div>
-                                    </div>
-                                  )}
+                                      </motion.div>
+                                    )}
+                                  </AnimatePresence>
                                 </div>
                               )}
                             </div>
-                          ))
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                </motion.div>
+                          ) : (
+                            <div className="bg-[#6b8e7f]/10 border border-[#6b8e7f]/30 p-3 rounded-xl text-[11px] text-[#304a3e] space-y-2">
+                              <div className="flex items-start gap-1.5 font-bold">
+                                <Check className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#6b8e7f]" />
+                                <span>判定：真實評論 ({review.audit.confidenceScore}% 信心度)</span>
+                              </div>
+                              <div className="font-semibold opacity-90 pl-5 leading-relaxed">
+                                <b>原因：</b>{review.audit.reason}
+                              </div>
+
+                              {/* Accordion Reasoning Path */}
+                              {hasCoT && (
+                                <div className="mt-2 pt-2 border-t border-[#6b8e7f]/20">
+                                  <button
+                                    onClick={() => toggleCoT(selectedInspectorTab, rIdx)}
+                                    className="flex items-center justify-between w-full text-left text-[10px] font-bold text-[#304a3e] bg-[#f5f1e8]/40 hover:bg-[#f5f1e8]/80 px-2.5 py-1.5 rounded-lg border border-[#d4c5b0]/30 transition-colors cursor-pointer"
+                                  >
+                                    <span className="flex items-center gap-1.5">
+                                      <span>AI 思考鏈 (CoT 推理)</span>
+                                    </span>
+                                    {cotExpanded ? (
+                                      <ChevronUp className="w-3.5 h-3.5 text-[#6b8e7f]" />
+                                    ) : (
+                                      <ChevronDown className="w-3.5 h-3.5 text-[#6b8e7f]" />
+                                    )}
+                                  </button>
+
+                                  <AnimatePresence initial={false}>
+                                    {cotExpanded && (
+                                      <motion.div
+                                        initial={{ height: 0, opacity: 0 }}
+                                        animate={{ height: 'auto', opacity: 1 }}
+                                        exit={{ height: 0, opacity: 0 }}
+                                        transition={{ duration: 0.2 }}
+                                        className="overflow-hidden"
+                                      >
+                                        <div className="mt-2 pl-2 text-[10px] space-y-2">
+                                          <div className="text-[#304a3e]/90 leading-relaxed bg-[#f5f1e8]/60 p-2.5 rounded-lg italic border border-[#d4c5b0]/30">
+                                            <b>推理過程：</b>{review.audit.reasoningPath}
+                                          </div>
+                                          <div className="grid grid-cols-3 gap-2 text-[9px] text-center pt-1 font-bold">
+                                            <div className="bg-[#6b8e7f]/20 py-1 px-1.5 rounded">
+                                              利益誘因: <span className="text-[#304a3e] font-black">{review.audit.incentiveIntensity}/5</span>
+                                            </div>
+                                            <div className="bg-[#6b8e7f]/20 py-1 px-1.5 rounded">
+                                              情感真實: <span className="text-[#304a3e] font-black">{review.audit.sentimentAuthenticity}/5</span>
+                                            </div>
+                                            <div className="bg-[#6b8e7f]/20 py-1 px-1.5 rounded">
+                                              描述細緻: <span className="text-[#304a3e] font-black">{review.audit.descriptionGranularity}/5</span>
+                                            </div>
+                                          </div>
+                                        </div>
+                                      </motion.div>
+                                    )}
+                                  </AnimatePresence>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
               );
-            })}
-          </div>
-        </DispenseSlot>
+            })()}
+          </motion.div>
+        )}
 
         {/* Action Buttons */}
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.5 }}
-          className="mt-8 flex gap-4 justify-center flex-wrap"
+          className="mt-10 flex gap-5 justify-center flex-wrap"
         >
           <motion.button
             onClick={() => navigate('/analyzer')}
-            whileHover={{ scale: 1.05 }}
-            whileTap={{ scale: 0.95 }}
-            className="bg-[#6b8e7f] hover:bg-[#5b7d6e] text-white px-7 py-3 rounded-full font-extrabold shadow-md border-2 border-[#4a5d52] transition-all cursor-pointer text-sm md:text-base"
+            whileHover={{ y: -4 }}
+            whileTap={{ y: 0, boxShadow: '0px 0px 0px 0px var(--color-primary)' }}
+            className="bg-[#6b8e7f] hover:bg-[#5b7d6e] text-white px-8 py-3.5 rounded-full font-black shadow-[4px_4px_0px_0px_#4a5d52] hover:shadow-[6px_6px_0px_0px_#4a5d52] border-3 border-[#4a5d52] transition-all cursor-pointer text-sm md:text-base font-display tracking-wider active:translate-y-1 active:shadow-none"
           >
             重新對比分析店家
           </motion.button>
           <motion.button
             onClick={() => navigate('/')}
-            whileHover={{ scale: 1.05 }}
-            whileTap={{ scale: 0.95 }}
-            className="bg-white hover:bg-[#f5f1e8] text-[#4a5d52] px-7 py-3 rounded-full font-extrabold shadow-md border-2 border-[#d4c5b0] transition-all cursor-pointer text-sm md:text-base"
+            whileHover={{ y: -4 }}
+            whileTap={{ y: 0, boxShadow: '0px 0px 0px 0px var(--color-primary)' }}
+            className="bg-white hover:bg-[#f5f1e8] text-[#4a5d52] px-8 py-3.5 rounded-full font-black shadow-[4px_4px_0px_0px_#4a5d52] hover:shadow-[6px_6px_0px_0px_#4a5d52] border-3 border-[#4a5d52] transition-all cursor-pointer text-sm md:text-base font-display tracking-wider active:translate-y-1 active:shadow-none"
           >
             返回首頁
           </motion.button>
