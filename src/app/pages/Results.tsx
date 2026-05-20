@@ -98,7 +98,7 @@ export function Results() {
   
   // Review Inspector Search & Filter states for each shop index
   const [inspectSearch, setInspectSearch] = useState<{ [key: number]: string }>({});
-  const [inspectFilter, setInspectFilter] = useState<{ [key: number]: 'all' | 'washed' | 'clean' }>({});
+  const [inspectFilter, setInspectFilter] = useState<{ [key: number]: 'all' | 'washed' | 'stage1' | 'stage2' | 'clean' }>({});
 
   const [apiKey, setApiKey] = useState(() => {
     if (location.state?.apiKey !== undefined) return location.state.apiKey;
@@ -161,7 +161,7 @@ export function Results() {
     
     // Initialize search & filter states
     const initialSearch: { [key: number]: string } = {};
-    const initialFilter: { [key: number]: 'all' | 'washed' | 'clean' } = {};
+    const initialFilter: { [key: number]: 'all' | 'washed' | 'stage1' | 'stage2' | 'clean' } = {};
     computed.forEach((_, idx) => {
       initialSearch[idx] = '';
       initialFilter[idx] = 'all';
@@ -1109,19 +1109,27 @@ export function Results() {
                       className="px-3 py-1 bg-white rounded-lg border border-[#d4c5b0] text-[11px] text-[#4a5d52] focus:outline-none focus:border-[#6b8e7f] placeholder-[#a0b3a0] w-36 shadow-xs font-semibold"
                     />
 
-                    <select
-                      value={inspectFilter[selectedInspectorTab] || 'all'}
-                      onChange={(e) => {
-                        const newFilters = { ...inspectFilter };
-                        newFilters[selectedInspectorTab] = e.target.value as 'all' | 'washed' | 'clean';
-                        setInspectFilter(newFilters);
-                      }}
-                      className="bg-white border border-[#d4c5b0] rounded-lg px-2 py-1 text-[11px] font-extrabold text-[#4a5d52] shadow-xs cursor-pointer"
-                    >
-                      <option value="all">顯示全部 ({result.totalReviews})</option>
-                      <option value="washed">僅看灌水 ({result.suspiciousReviews})</option>
-                      <option value="clean">僅看真實 ({result.totalReviews - result.suspiciousReviews})\</option>
-                    </select>
+                    {(() => {
+                      const stage1Count = result.auditedReviews.filter(r => r.audit.isWashed && !r.audit.reasoningPath).length;
+                      const stage2Count = result.auditedReviews.filter(r => r.audit.isWashed && r.audit.reasoningPath).length;
+                      return (
+                        <select
+                          value={inspectFilter[selectedInspectorTab] || 'all'}
+                          onChange={(e) => {
+                            const newFilters = { ...inspectFilter };
+                            newFilters[selectedInspectorTab] = e.target.value as 'all' | 'washed' | 'stage1' | 'stage2' | 'clean';
+                            setInspectFilter(newFilters);
+                          }}
+                          className="bg-white border border-[#d4c5b0] rounded-lg px-2 py-1 text-[11px] font-extrabold text-[#4a5d52] shadow-xs cursor-pointer"
+                        >
+                          <option value="all">顯示全部 ({result.totalReviews})</option>
+                          <option value="washed">所有灌水洗評 ({result.suspiciousReviews})</option>
+                          <option value="stage1">僅看一階規則攔截 ({stage1Count})</option>
+                          <option value="stage2">僅看二階 AI 攔截 ({stage2Count})</option>
+                          <option value="clean">僅看真實評論 ({result.totalReviews - result.suspiciousReviews})</option>
+                        </select>
+                      );
+                    })()}
                   </div>
                 );
               })()}
@@ -1185,6 +1193,8 @@ export function Results() {
                 if (!textMatch) return false;
 
                 if (filter === 'washed') return rev.audit.isWashed;
+                if (filter === 'stage1') return rev.audit.isWashed && !rev.audit.reasoningPath;
+                if (filter === 'stage2') return rev.audit.isWashed && !!rev.audit.reasoningPath;
                 if (filter === 'clean') return !rev.audit.isWashed;
                 return true;
               });
@@ -1217,9 +1227,18 @@ export function Results() {
                           {/* Audit Status Box */}
                           {isWashed ? (
                             <div className="bg-[#d4a5a5]/10 border border-[#d4a5a5]/30 p-3 rounded-xl text-[11px] text-[#8c4848] space-y-2">
-                              <div className="flex items-start gap-1.5 font-bold">
+                              <div className="flex items-start gap-1.5 font-bold flex-wrap">
                                 <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#8c4848]" />
                                 <span>判定：灌水洗評 ({review.audit.confidenceScore}% 信心度)</span>
+                                {hasCoT ? (
+                                  <span className="ml-1 bg-amber-100 text-amber-800 text-[9px] font-black px-1.5 py-0.5 rounded-md border border-amber-300">
+                                    二階 AI 攔截
+                                  </span>
+                                ) : (
+                                  <span className="ml-1 bg-rose-100 text-rose-800 text-[9px] font-black px-1.5 py-0.5 rounded-md border border-rose-300">
+                                    一階規則攔截
+                                  </span>
+                                )}
                               </div>
                               <div className="font-semibold opacity-90 pl-5 leading-relaxed">
                                 <b>原因：</b>{review.audit.reason}
@@ -1275,9 +1294,14 @@ export function Results() {
                             </div>
                           ) : (
                             <div className="bg-[#6b8e7f]/10 border border-[#6b8e7f]/30 p-3 rounded-xl text-[11px] text-[#304a3e] space-y-2">
-                              <div className="flex items-start gap-1.5 font-bold">
+                              <div className="flex items-start gap-1.5 font-bold flex-wrap">
                                 <Check className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#6b8e7f]" />
                                 <span>判定：真實評論 ({review.audit.confidenceScore}% 信心度)</span>
+                                {hasCoT && (
+                                  <span className="ml-1 bg-emerald-100 text-emerald-800 text-[9px] font-black px-1.5 py-0.5 rounded-md border border-emerald-300">
+                                    二階 AI 認證
+                                  </span>
+                                )}
                               </div>
                               <div className="font-semibold opacity-90 pl-5 leading-relaxed">
                                 <b>原因：</b>{review.audit.reason}
