@@ -174,7 +174,7 @@ export function Analyzer() {
     }, 5000);
 
     try {
-      const response = await fetch('http://localhost:5001/api/scrape', {
+      const response = await fetch('/api/scrape', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -188,7 +188,7 @@ export function Analyzer() {
       clearInterval(interval);
 
       if (!response.ok) {
-        throw new Error('伺服器爬取失敗，請確認本地爬蟲後端 (PORT 5001) 已開啟，且網址正確。');
+        throw new Error('伺服器爬取失敗，請確認本地爬蟲伺服器已開啟，且網址正確。');
       }
 
       const data = await response.json();
@@ -231,7 +231,7 @@ export function Analyzer() {
     } catch (e: any) {
       clearInterval(interval);
       console.error(e);
-      alert(`爬取錯誤: ${e.message || '請確認本地後端伺服器已開啟 (npm run start)'}`);
+      alert(`爬取錯誤: ${e.message || '請確認本地後端服務已開啟'}`);
     } finally {
       setIsAnalyzing(false);
       setScrapeLoadingStep('');

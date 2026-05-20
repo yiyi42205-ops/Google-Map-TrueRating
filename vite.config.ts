@@ -2,6 +2,7 @@ import { defineConfig } from 'vite'
 import path from 'path'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
+import { scraperMiddleware } from './review_scraper/vite_middleware'
 
 
 function figmaAssetResolver() {
@@ -23,6 +24,12 @@ export default defineConfig({
     // Tailwind is not being actively used – do not remove them
     react(),
     tailwindcss(),
+    {
+      name: 'scraper-api-middleware',
+      configureServer(server) {
+        server.middlewares.use(scraperMiddleware)
+      }
+    }
   ],
   resolve: {
     alias: {
