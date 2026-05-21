@@ -39,11 +39,29 @@ export function scraperMiddleware(req, res, next) {
         let stderrData = '';
 
         pyProcess.stdout.on('data', (data) => {
-          stdoutData += data.toString();
+          const str = data.toString();
+          stdoutData += str;
+          // Print non-JSON progress lines in real-time to Vite console
+          const lines = str.split('\n');
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed && !trimmed.startsWith('[') && !trimmed.startsWith('{') && !trimmed.startsWith('{"')) {
+              console.log(`[Scraper Python] ${trimmed}`);
+            }
+          }
         });
 
         pyProcess.stderr.on('data', (data) => {
-          stderrData += data.toString();
+          const str = data.toString();
+          stderrData += str;
+          // Print stderr in real-time
+          const lines = str.split('\n');
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed) {
+              console.log(`[Scraper Python] ${trimmed}`);
+            }
+          }
         });
 
         pyProcess.on('close', (code) => {
@@ -102,8 +120,10 @@ export function scraperMiddleware(req, res, next) {
     req.on('data', (chunk) => { body += chunk; });
     req.on('end', () => {
       try {
+        console.log(`[Audit API] Incoming POST request to /api/audit-local`);
         const { reviews } = JSON.parse(body);
         if (!reviews || !Array.isArray(reviews)) {
+          console.error(`[Audit API] Validation failed: Missing or invalid required field 'reviews'`);
           res.writeHead(400, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ error: 'Missing or invalid required field: reviews' }));
         }
@@ -137,6 +157,7 @@ export function scraperMiddleware(req, res, next) {
         };
 
         const prefix = `[Web UI] 正在分析 ${reviews.length} 則評論...`;
+        console.log(`[Audit API] Sending request to local Ollama (gemma4:e4b) for ${reviews.length} reviews...`);
         statsMonitor.setStoreInfo(prefix);
         statsMonitor.start();
         statsMonitor.setLLMMetrics('gemma4:e4b', 'Local (Ollama)', 0);
@@ -144,6 +165,7 @@ export function scraperMiddleware(req, res, next) {
 
         const ollamaReq = http.request(options, (ollamaRes) => {
           let data = '';
+          console.log(`[Audit API] Connection established with Ollama. Status: ${ollamaRes.statusCode}`);
           ollamaRes.on('data', (chunk) => {
             data += chunk;
           });
@@ -189,6 +211,9 @@ export function scraperMiddleware(req, res, next) {
                   parsedContent = parsedContent.reviews;
                 } else if (parsedContent.results && Array.isArray(parsedContent.results)) {
                   parsedContent = parsedContent.results;
+                } else if (parsedContent.username || parsedContent.isWashed !== undefined) {
+                  // Wrap single audited review object in an array
+                  parsedContent = [parsedContent];
                 } else {
                   const arrayKey = Object.keys(parsedContent).find(k => Array.isArray(parsedContent[k]));
                   if (arrayKey) {
@@ -203,12 +228,12 @@ export function scraperMiddleware(req, res, next) {
               const estimatedTokens = data.length / 4;
               statsMonitor.setLLMMetrics('gemma4:e4b', 'Local (Ollama)', estimatedTokens / durationSec);
               const summary = statsMonitor.getSummaryString();
-              console.log(`${prefix} 完成 (${summary})`);
+              console.log(`[Audit API] Successfully audited ${parsedContent.length} reviews in ${durationSec.toFixed(2)}s (${summary})`);
 
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ results: parsedContent }));
             } catch (err) {
-              console.error('[Ollama API] Failed to parse response:', err);
+              console.error('[Audit API] Failed to parse response:', err);
               res.writeHead(500, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ error: 'Failed to parse local Ollama response', details: err.message, raw: data }));
             }
@@ -224,7 +249,7 @@ export function scraperMiddleware(req, res, next) {
           } else {
             process.stdout.write('\r\x1b[K');
           }
-          console.error('[Ollama API] Connection error:', err);
+          console.error('[Audit API] Connection error:', err);
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Failed to connect to local Ollama service', details: err.message }));
         });
@@ -232,6 +257,7 @@ export function scraperMiddleware(req, res, next) {
         ollamaReq.write(postData);
         ollamaReq.end();
       } catch (err) {
+        console.error(`[Audit API] Request body parsing failed: ${err.message}`);
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Invalid JSON request body', details: err.message }));
       }

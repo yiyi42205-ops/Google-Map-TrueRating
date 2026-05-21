@@ -30,7 +30,7 @@ export function Analyzer() {
 
   // Custom Scraper states
   const [activeTab, setActiveTab] = useState<'preset' | 'scraper'>('preset');
-  const [scrapeUrl, setScrapeUrl] = useState('');
+  const [scrapeUrls, setScrapeUrls] = useState<string[]>(['', '', '']);
   const [maxReviews, setMaxReviews] = useState(50);
   const [scrapeLoadingStep, setScrapeLoadingStep] = useState('');
 
@@ -46,6 +46,17 @@ export function Analyzer() {
   }, []);
 
   const handleUrlChange = (index: number, value: string) => {
+    const trimmed = value.trim();
+    const isUrl = trimmed.startsWith('http://') || 
+                  trimmed.startsWith('https://') || 
+                  trimmed.includes('google.com') || 
+                  trimmed.includes('maps.app.goo.gl') || 
+                  trimmed.includes('/maps/');
+    if (isUrl) {
+      alert("內建測試數據庫僅支援搜尋與點選內建店家（例如：小高拉麵、清心師大）。\n如果您想輸入 Google Maps 網址進行即時爬取，請點選上方切換至「Google Maps 即時爬取」分頁。");
+      return;
+    }
+
     const newUrls = [...urls];
     newUrls[index] = value;
     setUrls(newUrls);
@@ -67,6 +78,18 @@ export function Analyzer() {
     const newUrls = [...urls];
     newUrls[index] = '';
     setUrls(newUrls);
+  };
+
+  const handleScrapeUrlChange = (index: number, value: string) => {
+    const newUrls = [...scrapeUrls];
+    newUrls[index] = value;
+    setScrapeUrls(newUrls);
+  };
+
+  const handleScrapeUrlClear = (index: number) => {
+    const newUrls = [...scrapeUrls];
+    newUrls[index] = '';
+    setScrapeUrls(newUrls);
   };
 
   const handleAddPreset = (restaurant: Restaurant) => {
@@ -154,16 +177,30 @@ export function Analyzer() {
   };
   
   const handleScrapeAndAnalyze = async () => {
-    if (!scrapeUrl.trim()) return;
+    const activeUrls = scrapeUrls.map(u => u.trim()).filter(Boolean);
+    if (activeUrls.length === 0) return;
+    
+    // Validate each active URL format
+    for (const url of activeUrls) {
+      if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        alert(`網址格式錯誤: "${url}" 必須以 http:// 或 https:// 開頭。`);
+        return;
+      }
+      const isGoogleMaps = (url.includes('google.') && url.includes('/maps/')) || url.includes('maps.app.goo.gl');
+      if (!isGoogleMaps) {
+        alert(`網址格式錯誤: "${url}" 不是正確的 Google Maps 商家網址 (例如包含 google.com/maps 或 maps.app.goo.gl)。`);
+        return;
+      }
+    }
     
     setIsAnalyzing(true);
-    setScrapeLoadingStep('正在啟動 Playwright 瀏覽器並開啟隱形模式...');
+    setScrapeLoadingStep(`正在平行啟動 ${activeUrls.length} 間店家的 Playwright 瀏覽器並開啟隱形模式...`);
     
     const steps = [
-      '正在定位商家評論分頁並繞過驗證碼...',
-      '正在滾動頁面懶加載更多歷史評價...',
-      '正在解析評論文字、發布時間與打卡照片...',
-      '正在整理資料格式並導回前端...'
+      '正在平行定位商家評論分頁並繞過驗證碼...',
+      '正在平行滾動頁面懶加載更多歷史評價...',
+      '正在平行解析評論文字、發布時間與打卡照片...',
+      '正在整理資料格式...'
     ];
     let stepIdx = 0;
     const interval = setInterval(() => {
@@ -171,46 +208,59 @@ export function Analyzer() {
         setScrapeLoadingStep(steps[stepIdx]);
         stepIdx++;
       }
-    }, 5000);
+    }, 4000);
 
     try {
-      const response = await fetch('/api/scrape', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          url: scrapeUrl,
-          maxReviews: maxReviews
-        })
+      const promises = activeUrls.map(async (currentUrl, i) => {
+        let storeName = `自定義店家 ${i + 1}`;
+        try {
+          const match = currentUrl.match(/\/place\/([^\/]+)/);
+          if (match && match[1]) {
+            storeName = decodeURIComponent(match[1].replace(/\+/g, ' '));
+          }
+        } catch (e) {}
+
+        try {
+          const response = await fetch('/api/scrape', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              url: currentUrl,
+              maxReviews: maxReviews
+            })
+          });
+
+          if (!response.ok) {
+            throw new Error('伺服器爬取失敗，請確認本地爬蟲伺服器已開啟，且網址正確。');
+          }
+
+          const data = await response.json();
+          if (!data.reviews || data.reviews.length === 0) {
+            throw new Error('無法抓取到任何評論，可能是網址無效或 Google 正在阻擋爬蟲請求。');
+          }
+
+          const mappedReviews = data.reviews.map((item: any) => ({
+            username: item.Username || '未知用戶',
+            stars: parseInt(item.Stars, 10) || 5,
+            time: item.Time || '',
+            text: item.Text || '',
+            images: item.Images ? item.Images.split(',').map((img: string) => img.trim()).filter(Boolean) : []
+          }));
+
+          return {
+            id: `custom_scraped_shop_${i}`,
+            name: storeName,
+            reviews: mappedReviews
+          };
+        } catch (e: any) {
+          throw new Error(`[${storeName}] 爬取失敗: ${e.message || '請確認本地後端服務已開啟'}`);
+        }
       });
 
+      const customShops = await Promise.all(promises);
       clearInterval(interval);
-
-      if (!response.ok) {
-        throw new Error('伺服器爬取失敗，請確認本地爬蟲伺服器已開啟，且網址正確。');
-      }
-
-      const data = await response.json();
-      if (!data.reviews || data.reviews.length === 0) {
-        throw new Error('無法抓取到任何評論，可能是網址無效或 Google 正在阻擋爬蟲請求。');
-      }
-
-      const mappedReviews = data.reviews.map((item: any) => ({
-        username: item.Username || '未知用戶',
-        stars: parseInt(item.Stars, 10) || 5,
-        time: item.Time || '',
-        text: item.Text || '',
-        images: item.Images ? item.Images.split(',').map((img: string) => img.trim()).filter(Boolean) : []
-      }));
-
-      let storeName = '自定義商家';
-      try {
-        const match = scrapeUrl.match(/\/place\/([^\/]+)/);
-        if (match && match[1]) {
-          storeName = decodeURIComponent(match[1].replace(/\+/g, ' '));
-        }
-      } catch (e) {}
 
       navigate('/results', {
         state: {
@@ -219,19 +269,12 @@ export function Analyzer() {
           apiKey,
           aiAuditCount,
           ollamaModelTag: ollamaModel,
-          customShops: [
-            {
-              id: 'custom_scraped_shop',
-              name: storeName,
-              reviews: mappedReviews
-            }
-          ]
+          customShops: customShops
         }
       });
     } catch (e: any) {
-      clearInterval(interval);
       console.error(e);
-      alert(`爬取錯誤: ${e.message || '請確認本地後端服務已開啟'}`);
+      alert(`爬取錯誤: ${e.message}`);
     } finally {
       setIsAnalyzing(false);
       setScrapeLoadingStep('');
@@ -239,6 +282,8 @@ export function Analyzer() {
   };
 
   const filledCount = urls.filter(url => url.trim() !== '').length;
+  const matchedCount = urls.filter(url => RESTAURANTS_DATA.some(r => r.name === url)).length;
+  const filledScrapeCount = scrapeUrls.filter(url => url.trim() !== '').length;
 
   const filteredSuggestions = searchQuery.trim() === ''
     ? []
@@ -343,7 +388,7 @@ export function Analyzer() {
                     <span>就緒，請至少添加 1 間店家進行對照</span>
                   </div>
                   <span className="text-[#4a5d52] bg-white px-3 py-1 rounded-full border border-[#d4c5b0]/60">
-                    已選 {filledCount} / 3 間
+                    已選 {matchedCount} / 3 間
                   </span>
                 </div>
 
@@ -450,9 +495,9 @@ export function Analyzer() {
                 {/* Main Action Button */}
                 <motion.button
                   onClick={handleAnalyze}
-                  disabled={isAnalyzing || filledCount === 0}
-                  whileHover={{ y: filledCount > 0 && !isAnalyzing ? -4 : 0 }}
-                  whileTap={{ y: filledCount > 0 && !isAnalyzing ? 0 : 0, boxShadow: '0px 0px 0px 0px var(--color-primary)' }}
+                  disabled={isAnalyzing || matchedCount === 0}
+                  whileHover={{ y: matchedCount > 0 && !isAnalyzing ? -4 : 0 }}
+                  whileTap={{ y: matchedCount > 0 && !isAnalyzing ? 0 : 0, boxShadow: '0px 0px 0px 0px var(--color-primary)' }}
                   className="w-full bg-[#6b8e7f] hover:bg-[#5b7d6e] text-white font-black text-sm md:text-base py-4 rounded-full shadow-[4px_4px_0px_0px_#4a5d52] hover:shadow-[6px_6px_0px_0px_#4a5d52] disabled:shadow-none disabled:bg-[#c9bfae] disabled:cursor-not-allowed border-3 border-[#4a5d52] disabled:border-[#a0b3a0] transition-all cursor-pointer font-display tracking-wider active:translate-y-1 active:shadow-none"
                 >
                   <AnimatePresence mode="wait">
@@ -475,7 +520,7 @@ export function Analyzer() {
                         exit={{ opacity: 0 }}
                         className="flex items-center justify-center gap-2 font-display text-base tracking-wide"
                       >
-                        開始評價「濾水分析」（對比 {filledCount} 間）
+                        開始評價「濾水分析」（對比 {matchedCount} 間）
                       </motion.div>
                     )}
                   </AnimatePresence>
@@ -483,59 +528,94 @@ export function Analyzer() {
               </>
             ) : (
               <div className="space-y-4">
-                <div className="bg-[#f5f1e8]/70 rounded-2xl p-3.5 border border-[#e8dcc8] flex items-center gap-2 text-xs font-bold text-[#6b8e7f]">
-                  <span className="relative flex h-2 w-2">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#e8c547] opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-[#e8c547]"></span>
+                <div className="bg-[#f5f1e8]/70 rounded-2xl p-3.5 border border-[#e8dcc8] flex items-center justify-between text-xs font-bold">
+                  <div className="flex items-center gap-2 text-[#6b8e7f]">
+                    <span className="relative flex h-2 w-2">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#e8c547] opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2 w-2 bg-[#e8c547]"></span>
+                    </span>
+                    <span>即時爬蟲就緒，請至少提供 1 間商家網址</span>
+                  </div>
+                  <span className="text-[#4a5d52] bg-white px-3 py-1 rounded-full border border-[#d4c5b0]/60 font-bold whitespace-nowrap">
+                    已選 {filledScrapeCount} / 3 間
                   </span>
-                  <span>即時爬蟲就緒，請提供 Google Maps 商家網址</span>
                 </div>
 
-                <div className="rounded-2xl p-5 bg-[#f5f1e8]/40 border border-[#e8dcc8] space-y-4">
-                  <div>
-                    <label className="block text-xs font-black text-[#4a5d52] mb-1.5 flex items-center gap-1.5">
-                      <LinkIcon className="w-3.5 h-3.5" />
-                      Google Maps 商家評論網址 (URL)
-                    </label>
-                    <div className="relative">
-                      <Globe className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-[#6b8e7f]" />
-                      <input
-                        type="text"
-                        value={scrapeUrl}
-                        onChange={(e) => setScrapeUrl(e.target.value)}
-                        placeholder="https://www.google.com/maps/place/..."
-                        className="w-full pl-10 pr-4 py-2.5 bg-white rounded-xl border border-[#d4c5b0] focus:border-[#6b8e7f] focus:ring-1 focus:ring-[#6b8e7f] outline-none text-xs md:text-sm text-[#4a5d52] font-semibold placeholder-[#a0b3a0] transition-shadow shadow-xs"
-                      />
-                    </div>
-                  </div>
+                <div className="space-y-4 mb-4">
+                  {scrapeUrls.map((url, index) => {
+                    const isEmpty = !url.trim();
+                    return (
+                      <motion.div
+                        key={index}
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ delay: index * 0.08 }}
+                        className={`rounded-2xl p-4 border-2 transition-all duration-200 ${
+                          isEmpty
+                            ? 'bg-[#f5f1e8]/30 border-dashed border-[#d4c5b0] hover:bg-white hover:border-[#4a5d52] hover:shadow-[2px_2px_0px_0px_#4a5d52]'
+                            : 'bg-white border-[#4a5d52] shadow-[2px_2px_0px_0px_#4a5d52]'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 mb-2">
+                          <div className={`font-black px-2.5 py-0.5 rounded-md text-[10px] border ${
+                            isEmpty
+                              ? 'bg-white text-[#6b8e7f] border-[#d4c5b0] border-dashed'
+                              : 'bg-[#6b8e7f] text-white border-[#4a5d52]'
+                          }`}>
+                            即時爬取店家 {index + 1}
+                          </div>
+                          {url && (
+                            <motion.button
+                              onClick={() => handleScrapeUrlClear(index)}
+                              whileHover={{ scale: 1.1 }}
+                              whileTap={{ scale: 0.9 }}
+                              className="ml-auto bg-[#d4a5a5] text-white p-1 rounded-full border border-[#4a5d52] cursor-pointer shadow-xs"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </motion.button>
+                          )}
+                        </div>
+                        <div className="relative">
+                          <Globe className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-[#6b8e7f]" />
+                          <input
+                            type="text"
+                            value={url}
+                            onChange={(e) => handleScrapeUrlChange(index, e.target.value)}
+                            placeholder="https://www.google.com/maps/place/..."
+                            className="w-full pl-10 pr-4 py-2.5 bg-white rounded-xl border border-[#d4c5b0] focus:border-[#6b8e7f] focus:ring-1 focus:ring-[#6b8e7f] outline-none text-xs md:text-sm text-[#4a5d52] font-semibold placeholder-[#a0b3a0] transition-shadow shadow-xs"
+                          />
+                        </div>
+                      </motion.div>
+                    );
+                  })}
+                </div>
 
-                  <div>
-                    <div className="flex justify-between items-center mb-1.5">
-                      <label className="text-xs font-black text-[#4a5d52] flex items-center gap-1.5">
-                        <Sliders className="w-3.5 h-3.5" />
-                        限制抓取評論筆數
-                      </label>
-                      <span className="text-[10px] font-extrabold text-[#6b8e7f] bg-white px-2 py-0.5 rounded border border-[#d4c5b0]">
-                        {maxReviews} 筆
-                      </span>
-                    </div>
-                    <input
-                      type="range"
-                      min="10"
-                      max="200"
-                      step="10"
-                      value={maxReviews}
-                      onChange={(e) => setMaxReviews(parseInt(e.target.value))}
-                      className="w-full accent-[#6b8e7f] h-1.5 bg-[#e8dcc8] rounded-lg appearance-none cursor-pointer"
-                    />
+                <div className="rounded-2xl p-5 bg-[#f5f1e8]/40 border border-[#e8dcc8]">
+                  <div className="flex justify-between items-center mb-1.5">
+                    <label className="text-xs font-black text-[#4a5d52] flex items-center gap-1.5">
+                      <Sliders className="w-3.5 h-3.5" />
+                      限制抓取評論筆數 (每間商家)
+                    </label>
+                    <span className="text-[10px] font-extrabold text-[#6b8e7f] bg-white px-2 py-0.5 rounded border border-[#d4c5b0]">
+                      {maxReviews} 筆
+                    </span>
                   </div>
+                  <input
+                    type="range"
+                    min="10"
+                    max="200"
+                    step="10"
+                    value={maxReviews}
+                    onChange={(e) => setMaxReviews(parseInt(e.target.value))}
+                    className="w-full accent-[#6b8e7f] h-1.5 bg-[#e8dcc8] rounded-lg appearance-none cursor-pointer"
+                  />
                 </div>
 
                 <motion.button
                   onClick={handleScrapeAndAnalyze}
-                  disabled={isAnalyzing || !scrapeUrl.trim()}
-                  whileHover={{ scale: scrapeUrl.trim() && !isAnalyzing ? 1.02 : 1 }}
-                  whileTap={{ scale: scrapeUrl.trim() && !isAnalyzing ? 0.98 : 1 }}
+                  disabled={isAnalyzing || filledScrapeCount === 0}
+                  whileHover={{ scale: filledScrapeCount > 0 && !isAnalyzing ? 1.02 : 1 }}
+                  whileTap={{ scale: filledScrapeCount > 0 && !isAnalyzing ? 0.98 : 1 }}
                   className="w-full bg-gradient-to-r from-[#6b8e7f] to-[#4a5d52] hover:opacity-95 text-white font-extrabold text-sm md:text-base py-3.5 rounded-full shadow-md disabled:from-[#c9bfae] disabled:to-[#c9bfae] disabled:cursor-not-allowed border-2 border-[#4a5d52] disabled:border-[#a0b3a0] transition-all cursor-pointer flex items-center justify-center gap-2"
                 >
                   {isAnalyzing ? (
@@ -546,7 +626,7 @@ export function Analyzer() {
                   ) : (
                     <>
                       <Globe className="w-4 h-4 text-[#e8c547] animate-pulse" />
-                      一鍵抓取評論並開啟 AI 審計
+                      一鍵抓取評論並開啟 AI 審計 {filledScrapeCount > 0 ? `（共 ${filledScrapeCount} 間）` : ''}
                     </>
                   )}
                 </motion.button>

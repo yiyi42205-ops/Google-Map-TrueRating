@@ -3,13 +3,24 @@ from flask_cors import CORS
 import requests
 import json
 import re
+import logging
+import time
+import traceback
 from scraper import scrape_google_maps_reviews
+
+# Configure logging format and level
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s in %(module)s: %(message)s'
+)
+logger = logging.getLogger("ScraperServer")
 
 app = Flask(__name__)
 CORS(app)
 
 @app.route("/", methods=["GET"])
 def index():
+    logger.info(f"Root path '/' accessed by IP: {request.remote_addr}")
     return jsonify({
         "status": "ok",
         "message": "Google Maps Scraper and Ollama Proxy Service is running"
@@ -17,46 +28,61 @@ def index():
 
 @app.route("/api/scrape", methods=["POST"])
 def scrape():
+    start_time = time.time()
+    ip = request.remote_addr
+    logger.info(f"POST /api/scrape request from IP: {ip}")
+    
     data = request.get_json() or {}
     url = data.get("url")
     if not url:
+        logger.error(f"Scrape request from {ip} failed validation: Missing required field 'url'")
         return jsonify({"error": "Missing required field: url"}), 400
     
     max_reviews = data.get("maxReviews") or 50
     try:
         max_reviews = int(max_reviews)
     except ValueError:
+        logger.warning(f"Invalid maxReviews value received: {data.get('maxReviews')}. Defaulting to 50.")
         max_reviews = 50
 
     try:
-        print(f"[Python Scraper Server] Scraping reviews for URL: {url} (limit: {max_reviews})")
+        logger.info(f"Starting review scraping for URL: {url} (limit: {max_reviews})")
         df = scrape_google_maps_reviews(url, max_reviews=max_reviews)
         
         if df.empty:
+            logger.info("Scraping completed. No reviews retrieved.")
             records = []
         else:
             records = df.to_dict(orient="records")
+            logger.info(f"Scraping completed successfully. Retrieved {len(records)} reviews in {time.time() - start_time:.2f} seconds.")
             
         return jsonify({"reviews": records})
     except Exception as e:
-        print(f"[Python Scraper Server] Scraping error: {e}")
+        logger.error(f"Scraping error occurred: {e}")
+        logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/audit-local", methods=["POST"])
 def audit_local():
-    # NOTE: This endpoint is preserved for test scripts like test_two_stages.cjs.
-    # The main frontend web application now calls Ollama directly via Vite proxy.
+    start_time = time.time()
+    ip = request.remote_addr
+    logger.info(f"POST /api/audit-local request from IP: {ip}")
+    
     data = request.get_json() or {}
     reviews = data.get("reviews")
     if not reviews or not isinstance(reviews, list):
+        logger.error(f"Audit request from {ip} failed validation: Missing or invalid required field 'reviews'")
         return jsonify({"error": "Missing or invalid required field: reviews"}), 400
 
+    logger.info(f"Loading audit prompt template for {len(reviews)} reviews...")
     import os
     prompt_path = os.path.join(os.path.dirname(__file__), 'audit_prompt.txt')
     try:
         with open(prompt_path, 'r', encoding='utf-8') as f:
             prompt_template = f.read()
+        logger.info("Successfully read prompt template.")
     except Exception as e:
+        logger.error(f"Failed to read prompt template file: {e}")
         return jsonify({"error": f"Failed to read prompt template: {str(e)}"}), 500
 
     prompt = (
@@ -82,13 +108,14 @@ def audit_local():
     }
 
     try:
-        print(f"[Python Scraper Server] Forwarding {len(reviews)} reviews to local Ollama...")
+        logger.info(f"Forwarding audit request of {len(reviews)} reviews to local Ollama (gemma4:e4b)...")
         response = requests.post(
             "http://127.0.0.1:11434/api/chat",
             json=ollama_payload,
             headers={"Content-Type": "application/json"}
         )
         response.raise_for_status()
+        logger.info("Ollama request returned success. Parsing response content...")
         
         response_json = response.json()
         content_str = response_json.get("message", {}).get("content", "").strip()
@@ -129,11 +156,14 @@ def audit_local():
             else:
                 raise ValueError("Model response is not a valid JSON structure")
 
+        logger.info(f"Successfully processed audit results of {len(parsed_content)} items in {time.time() - start_time:.2f} seconds.")
         return jsonify({"result": parsed_content})
     except Exception as e:
-        print(f"[Python Scraper Server] Local audit proxy error: {e}")
+        logger.error(f"Local audit proxy error: {e}")
+        logger.error(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    print("[Python Scraper Server] Starting Flask server on port 5001...")
+    logger.info("Initializing Flask server configurations...")
+    logger.info("Starting Flask server on host 0.0.0.0, port 5001...")
     app.run(host="0.0.0.0", port=5001)

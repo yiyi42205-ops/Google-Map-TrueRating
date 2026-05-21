@@ -6,6 +6,18 @@ import pandas as pd
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 from bs4 import BeautifulSoup
+import sys
+import builtins
+
+# Override print to write to stderr by default so that stdout contains only the final JSON data.
+# This prevents log messages from interfering with JSON parsing in the middleware.
+_print = builtins.print
+def print(*args, **kwargs):
+    if 'file' not in kwargs:
+        kwargs['file'] = sys.stderr
+        if 'flush' not in kwargs:
+            kwargs['flush'] = True
+    _print(*args, **kwargs)
 
 def parse_relative_time(relative_str: str) -> str:
     """
@@ -94,12 +106,14 @@ def scroll_and_extract_reviews(page, max_reviews: int = 50):
     Scrolls the Google Maps review pane down to sequentially load lazy-loaded elements.
     """
     reviews_data = []
+    print("[Python Scraper] Waiting for review elements (.jftiEf) to appear...")
     # Ensure reviews are loaded by waiting or scrolling a bit
     try:
-        page.wait_for_selector('.jftiEf', timeout=50000)
-    except Exception:
+        page.wait_for_selector('.jftiEf', timeout=15000)
+        print("[Python Scraper] Found initial review elements.")
+    except Exception as e:
         # If not found, try to scroll the main scrollable area a few times to trigger lazy loading
-        print("Initial wait for reviews timeout, attempting to scroll main pane...")
+        print(f"[Python Scraper] Initial wait for reviews timeout/error: {e}. Attempting to scroll main pane...")
         page.evaluate('''
             var main_pane = document.querySelector('.kA9KIf.dS8AEf, div[role="main"] .kA9KIf, .m6QErb.DxyBCb');
             if (main_pane) {
@@ -110,13 +124,15 @@ def scroll_and_extract_reviews(page, max_reviews: int = 50):
         ''')
         time.sleep(6) # wait for the scrolling to finish
         try:
-            page.wait_for_selector('.jftiEf', timeout=50000)
-        except Exception as e:
-            print("Could not find any review elements (.jftiEf) even after scrolling.")
+            page.wait_for_selector('.jftiEf', timeout=15000)
+            print("[Python Scraper] Found review elements after scrolling main pane.")
+        except Exception as e_fallback:
+            print(f"[Python Scraper] Could not find any review elements (.jftiEf) even after scrolling: {e_fallback}")
             return reviews_data
     
     last_review_count = 0
     consecutive_same_count = 0
+    print("[Python Scraper] Starting review scroll loop...")
     
     while len(reviews_data) < max_reviews:
         # Scroll down by finding the closest scrollable container to the reviews
@@ -166,11 +182,14 @@ def scroll_and_extract_reviews(page, max_reviews: int = 50):
         
         # The main wrapper for a single review
         review_elements = soup.find_all("div", class_="jftiEf")
+        print(f"[Python Scraper] Currently found {len(review_elements)} review elements on page (Target: {max_reviews}).")
         
         # If no new reviews are loading, we might have hit the end
         if len(review_elements) == last_review_count:
             consecutive_same_count += 1
+            print(f"[Python Scraper] Review count didn't increase ({len(review_elements)}). Consecutive attempts: {consecutive_same_count}/3")
             if consecutive_same_count >= 3:
+                print("[Python Scraper] Hit the end of reviews or page stopped loading new ones.")
                 break
         else:
             consecutive_same_count = 0
@@ -224,54 +243,223 @@ def scroll_and_extract_reviews(page, max_reviews: int = 50):
 
     return reviews_data
 
+def safe_rmtree(path: str, max_retries: int = 10, delay: float = 0.5):
+    """
+    Attempts to delete a directory, retrying if files are locked.
+    """
+    import shutil
+    import time
+    import os
+    if not os.path.exists(path):
+        return
+    for i in range(max_retries):
+        try:
+            shutil.rmtree(path)
+            print(f"[Python Scraper] Successfully removed directory: {path}")
+            return
+        except Exception as e:
+            if i == max_retries - 1:
+                print(f"[Python Scraper] Warning: Final attempt to delete {path} failed: {e}")
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                print(f"[Python Scraper] Directory {path} locked or busy, retrying in {delay}s... (Attempt {i+1}/{max_retries})")
+                time.sleep(delay)
+
+def cleanup_old_sessions(parent_dir: str, max_age_seconds: int = 300):
+    """
+    Cleans up any subdirectories in parent_dir that are older than max_age_seconds.
+    Also cleans up legacy chrome_auth_data_* directories in the current working directory.
+    """
+    import os
+    import time
+    
+    # 1. Clean up legacy directories in current working directory
+    now = time.time()
+    for item in os.listdir("."):
+        if os.path.isdir(item) and item.startswith("chrome_auth_data_") and item != "chrome_auth_data":
+            try:
+                mtime = os.path.getmtime(item)
+                if now - mtime > max_age_seconds:
+                    print(f"[Python Scraper] Cleaning up legacy auth directory in cwd: {item}")
+                    safe_rmtree(item)
+            except Exception as e:
+                print(f"[Python Scraper] Warning: failed to clean up legacy directory {item}: {e}")
+                
+    # 2. Clean up session directories in the parent_dir
+    if not os.path.exists(parent_dir):
+        return
+    for item in os.listdir(parent_dir):
+        item_path = os.path.join(parent_dir, item)
+        if os.path.isdir(item_path) and item.startswith("session_"):
+            try:
+                mtime = os.path.getmtime(item_path)
+                if now - mtime > max_age_seconds:
+                    print(f"[Python Scraper] Cleaning up expired session directory: {item_path}")
+                    safe_rmtree(item_path)
+            except Exception as e:
+                print(f"[Python Scraper] Warning: failed to clean up old session {item_path}: {e}")
+
 def scrape_google_maps_reviews(url: str, max_reviews: int = 50) -> pd.DataFrame:
-    with sync_playwright() as p:
-        # 使用儲存設定的目錄 (Persistent Context)，讓登入狀態可以保留
-        user_data_dir = "chrome_auth_data"
+    print(f"[Python Scraper] Starting scraper for URL: {url} (max_reviews={max_reviews})")
+    import hashlib
+    import os
+    
+    parent_dir = "chrome_auth_data"
+    cleanup_old_sessions(parent_dir)
+    
+    url_hash = hashlib.md5(url.encode('utf-8')).hexdigest()[:8]
+    os.makedirs(parent_dir, exist_ok=True)
+    user_data_dir = os.path.join(parent_dir, f"session_{url_hash}")
+    print(f"[Python Scraper] User data directory set to: {user_data_dir}")
+    
+    data = []
+    max_attempts = 3
+    
+    for attempt in range(1, max_attempts + 1):
+        print(f"[Python Scraper] Scrape attempt {attempt} of {max_attempts}...")
         try:
-            # 優先嘗試啟動本機的 Chrome 瀏覽器
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                headless=False, 
-                channel="chrome", 
-                ignore_default_args=["--enable-automation"],
-                args=['--disable-blink-features=AutomationControlled'],
-                locale="zh-TW",
-                viewport={"width": 1280, "height": 720}
-            )
-        except Exception:
-            # Fallback to default chromium
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                headless=False, 
-                ignore_default_args=["--enable-automation"],
-                args=['--disable-blink-features=AutomationControlled'],
-                locale="zh-TW",
-                viewport={"width": 1280, "height": 720}
-            )
-            
-        page = context.pages[0] if context.pages else context.new_page()
-        Stealth().apply_stealth_sync(page)
+            with sync_playwright() as p:
+                try:
+                    print("[Python Scraper] Attempting to launch system Google Chrome (channel='chrome')...")
+                    # 優先嘗試啟動本機的 Chrome 瀏覽器
+                    context = p.chromium.launch_persistent_context(
+                        user_data_dir=user_data_dir,
+                        headless=False, 
+                        channel="chrome", 
+                        ignore_default_args=["--enable-automation"],
+                        args=['--disable-blink-features=AutomationControlled', '--new-window'],
+                        locale="zh-TW",
+                        viewport={"width": 1280, "height": 720}
+                    )
+                    print("[Python Scraper] System Google Chrome launched successfully.")
+                except Exception as e:
+                    print(f"[Python Scraper] Failed to launch system Google Chrome: {e}")
+                    print("[Python Scraper] Falling back to default Playwright Chromium browser...")
+                    try:
+                        # Fallback to default chromium
+                        context = p.chromium.launch_persistent_context(
+                            user_data_dir=user_data_dir,
+                            headless=False, 
+                            ignore_default_args=["--enable-automation"],
+                            args=['--disable-blink-features=AutomationControlled', '--new-window'],
+                            locale="zh-TW",
+                            viewport={"width": 1280, "height": 720}
+                        )
+                        print("[Python Scraper] Playwright Chromium browser launched successfully.")
+                    except Exception as fallback_e:
+                        print(f"[Python Scraper] Fallback launch failed: {fallback_e}")
+                        print("[Python Scraper] Critical Hint: Make sure you ran 'playwright install' or no other chrome process is locking the user data directory.")
+                        raise fallback_e
+                    
+                page = context.pages[0] if context.pages else context.new_page()
+                Stealth().apply_stealth_sync(page)
+                
+                # Navigate to the Maps URI
+                print(f"[Python Scraper] Navigating to URL: {url}")
+                page.goto(url, wait_until="load")
+                print("[Python Scraper] Navigation complete. Loading page elements...")
+                
+                # We need to ensure we are on the "Reviews" tab if it's a general place URL
+                print("[Python Scraper] Locating Reviews tab/button...")
+                tab_found = False
+                try:
+                    # Wait for either tabs or review elements to be present in the DOM
+                    try:
+                        page.wait_for_selector('[role="tab"], .jftiEf, button:has-text("更多評論"), button:has-text("More reviews")', timeout=10000)
+                    except Exception as wait_e:
+                        print(f"[Python Scraper] Warning: timeout waiting for tab/review indicators: {wait_e}")
         
-        # Navigate to the Maps URI
-        page.goto(url, wait_until="load")
-        
-        # We need to ensure we are on the "Reviews" tab if it's a general place URL
-        # We can look for the button containing text "Reviews" or "評論" 
-        try:
-            # Look for the Reviews tab, or a generic "More reviews" / "Reviews" button
-            # This handles Google Maps A/B testing layouts where Reviews is a button instead of a tab
-            tab_locator = page.locator("button[role='tab']:has-text('Reviews'), button[role='tab']:has-text('評論'), button:has-text('更多評論'), button:has-text('More reviews')")
-            if tab_locator.count() > 0:
-                tab_locator.first.click(timeout=50000)
-            time.sleep(3)
-        except Exception:
-            pass
-        
-        data = scroll_and_extract_reviews(page, max_reviews)
-        context.close()
-        
-        return pd.DataFrame(data)
+                    # Run JS evaluation to locate and click the correct Reviews tab or button
+                    click_result = page.evaluate('''() => {
+                        const keywords = ['評論', '评论', 'review', 'クチコミ', '리뷰', 'reseña', 'avis', 'rezension', 'recensioni', 'comentários', 'отзывы'];
+                        const excludeKeywords = ['撰寫', 'write', 'post', 'add', 'create', '編輯', 'edit'];
+                        
+                        const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
+                        
+                        // 1. Try to find the Reviews tab
+                        let reviewsTab = tabs.find(tab => {
+                            const text = tab.textContent.trim().toLowerCase();
+                            const label = (tab.getAttribute('aria-label') || '').toLowerCase();
+                            const matchesKw = keywords.some(kw => text.includes(kw) || label.includes(kw));
+                            const matchesExclude = excludeKeywords.some(ex => text.includes(ex) || label.includes(ex));
+                            return matchesKw && !matchesExclude;
+                        });
+                        
+                        // Fallback tab matching with jslog (145620 is Google Maps' compiled ID for the Reviews tab)
+                        if (!reviewsTab) {
+                            reviewsTab = tabs.find(tab => {
+                                const jslog = tab.getAttribute('jslog') || '';
+                                return jslog.includes('145620');
+                            });
+                        }
+                        
+                        if (reviewsTab) {
+                            const isSelected = reviewsTab.getAttribute('aria-selected') === 'true' || 
+                                              (reviewsTab.className && reviewsTab.className.includes('selected'));
+                            if (isSelected) {
+                                return { success: true, action: "none", message: "Reviews tab is already selected", name: reviewsTab.textContent.trim() };
+                            } else {
+                                reviewsTab.click();
+                                return { success: true, action: "click_tab", message: "Clicked reviews tab", name: reviewsTab.textContent.trim() };
+                            }
+                        }
+                        
+                        // 2. Fallback to buttons/links
+                        const interactives = Array.from(document.querySelectorAll('button, [role="button"], a'));
+                        let reviewsBtn = interactives.find(btn => {
+                            const text = btn.textContent.trim().toLowerCase();
+                            const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+                            
+                            const matchesKw = keywords.some(kw => text.includes(kw) || label.includes(kw));
+                            const matchesExclude = excludeKeywords.some(ex => text.includes(ex) || label.includes(ex));
+                            const isReviewTrigger = text.includes('更多') || text.includes('more') || /\\d+/.test(text) || text === '評論' || text === 'reviews';
+                            
+                            return matchesKw && !matchesExclude && isReviewTrigger;
+                        });
+                        
+                        if (reviewsBtn) {
+                            reviewsBtn.click();
+                            return { success: true, action: "click_button", message: "Clicked reviews button/link", name: reviewsBtn.textContent.trim() };
+                        }
+                        
+                        return { success: false, message: "Could not find any Reviews tab or button" };
+                    }''')
+                    
+                    print(f"[Python Scraper] Navigation result: {click_result}")
+                    tab_found = click_result.get("success", False)
+                    
+                    if tab_found:
+                        if click_result.get("action") != "none":
+                            time.sleep(4)
+                        
+                except Exception as tab_e:
+                    print(f"[Python Scraper] Warning/Exception locating reviews tab: {tab_e}")
+                    tab_found = False
+                
+                if not tab_found:
+                    raise RuntimeError("Reviews tab/button not found")
+                
+                data = scroll_and_extract_reviews(page, max_reviews)
+                context.close()
+                print(f"[Python Scraper] Scrape process finished on attempt {attempt}. Extracted {len(data)} review records.")
+                break  # Success, exit retry loop
+        except Exception as run_e:
+            print(f"[Python Scraper] Error during attempt {attempt}: {run_e}")
+            if attempt < max_attempts:
+                print(f"[Python Scraper] Retrying in 2 seconds...")
+                time.sleep(2)
+                continue
+            else:
+                if "Reviews tab/button not found" in str(run_e):
+                    print(f"[Python Scraper] Failed to find reviews tab after {max_attempts} attempts.")
+                    break
+                raise run_e
+        finally:
+            if os.path.exists(user_data_dir):
+                print(f"[Python Scraper] Cleaning up user data directory: {user_data_dir}")
+                safe_rmtree(user_data_dir)
+
+    return pd.DataFrame(data)
 
 if __name__ == "__main__":
     import sys
@@ -288,16 +476,16 @@ if __name__ == "__main__":
         try:
             df = scrape_google_maps_reviews(url, max_reviews=max_reviews)
             if df.empty:
-                print(json.dumps([]))
+                print(json.dumps([]), file=sys.stdout)
             else:
                 # Convert DataFrame to a list of dicts and print as JSON
                 records = df.to_dict(orient="records")
-                print(json.dumps(records, ensure_ascii=False))
+                print(json.dumps(records, ensure_ascii=False), file=sys.stdout)
         except Exception as e:
             # Output error inside JSON to let caller handle
-            print(json.dumps({"error": str(e)}, ensure_ascii=False))
+            print(json.dumps({"error": str(e)}, ensure_ascii=False), file=sys.stdout)
     else:
         # Default test block
         test_url = "https://www.google.com/maps/place/Googleplex/@37.4220656,-122.0840897,17z/data=!3m1!4b1!4m6!3m5!1s0x808fba02425dad8f:0x6c296c66619367e0!8m2!3d37.4220656!4d-122.0840897!16zL20vMDMweXNi?entry=ttu"
         df = scrape_google_maps_reviews(test_url, max_reviews=10)
-        print(df.head())
+        print(df.head(), file=sys.stdout)

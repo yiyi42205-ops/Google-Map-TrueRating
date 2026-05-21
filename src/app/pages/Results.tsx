@@ -673,7 +673,7 @@ export function Results() {
                           <div>
                             <h4 className="font-extrabold text-[#4a5d52] text-sm flex items-center gap-1.5">
                               <span className="inline-block w-2.5 h-2.5 rounded-md bg-[#6b8e7f]"></span>
-                              {shop.name}
+                              {cleanStoreName(shop.storeName)}
                             </h4>
                             <p className="text-[10px] text-[#6b8e7f] mt-0.5 font-bold">總評論數量：{shop.totalReviews} 則</p>
                           </div>

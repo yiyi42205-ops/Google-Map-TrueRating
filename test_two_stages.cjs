@@ -326,6 +326,7 @@ function callLocalGemma(payloadReviews) {
 async function analyzeStore(storeName, reviews) {
   const totalReviews = reviews.length;
   if (totalReviews === 0) {
+    console.log(`[兩階段審計] 商家: ${storeName} | 無評論可分析`);
     return { trustScore: 100, suspiciousReviews: 0 };
   }
 
@@ -342,6 +343,8 @@ async function analyzeStore(storeName, reviews) {
   const monthlyAverage = months.length > 0 
     ? months.reduce((sum, m) => sum + monthlyCounts[m], 0) / months.length 
     : 0;
+
+  console.log(`[兩階段審計] 商家: ${storeName} | 共載入 ${totalReviews} 則評論，平均每月發表 ${monthlyAverage.toFixed(1)} 則。`);
 
   const reviewsWithMetadata = reviews.map(r => {
     let isSpikePeriod = false;
@@ -398,6 +401,8 @@ async function analyzeStore(storeName, reviews) {
     }
   });
 
+  console.log(`[第一階段結果] 已排除/過濾出 ${stage1WashedSet.size} 則疑似洗評（內含 ${duplicateFlags.size} 則內文高度重複模板）。`);
+
   // Ambiguous Reviews for Gemini sampling (Stage 2)
   const ambiguousReviews = reviewsWithMetadata.filter((r, idx) => {
     return r.stars === 5 && !stage1WashedSet.has(idx) && r.text.trim().length > 0;
@@ -414,10 +419,13 @@ async function analyzeStore(storeName, reviews) {
     }
   }
 
+  console.log(`[第二階段抽取] 共有 ${ambiguousCount} 則模糊的五星好評，從中均勻抽取 ${sampleReviews.length} 則送交 AI 進行深度語意審核。`);
+
   // Call AI if sample found
   if (sampleReviews.length > 0) {
     try {
       const useLocal = process.env.AUDIT_MODEL === 'gemma';
+      console.log(`[第二階段審核] 正在呼叫 ${useLocal ? '本地 Gemma (via Ollama)' : '雲端 Gemini 2.5 Flash'} 進行語意分析與利益誘因審查...`);
       const geminiResults = useLocal 
         ? await callLocalGemma(sampleReviews.map(r => ({
             username: r.username,
@@ -433,6 +441,8 @@ async function analyzeStore(storeName, reviews) {
             daysElapsed: r.daysElapsed,
             isSpikePeriod: r.isSpikePeriod
           })));
+
+      console.log(`[第二階段結果] AI 審核完成，已成功解析 ${geminiResults.length} 則抽樣結果。`);
 
       geminiResults.forEach(item => {
         const inc = Math.min(5, Math.max(1, item.incentiveIntensity || 1));

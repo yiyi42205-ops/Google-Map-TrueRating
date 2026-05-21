@@ -5,3 +5,4 @@ review_scraper/node_modules
 review_scraper/venv
 review_scraper/__pycache__
 .DS_Store
+.vercel
