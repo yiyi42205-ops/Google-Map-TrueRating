@@ -180,16 +180,15 @@ export function Analyzer() {
     const activeUrls = scrapeUrls.map(u => u.trim()).filter(Boolean);
     if (activeUrls.length === 0) return;
     
-    // Validate each active URL format
+    // Validate each active URL/place name format
     for (const url of activeUrls) {
-      if (!url.startsWith('http://') && !url.startsWith('https://')) {
-        alert(`網址格式錯誤: "${url}" 必須以 http:// 或 https:// 開頭。`);
-        return;
-      }
-      const isGoogleMaps = (url.includes('google.') && url.includes('/maps/')) || url.includes('maps.app.goo.gl');
-      if (!isGoogleMaps) {
-        alert(`網址格式錯誤: "${url}" 不是正確的 Google Maps 商家網址 (例如包含 google.com/maps 或 maps.app.goo.gl)。`);
-        return;
+      const isUrl = url.startsWith('http://') || url.startsWith('https://');
+      if (isUrl) {
+        const isGoogleMaps = (url.includes('google.') && url.includes('/maps/')) || url.includes('maps.app.goo.gl');
+        if (!isGoogleMaps) {
+          alert(`網址格式錯誤: "${url}" 不是正確的 Google Maps 商家網址 (例如包含 google.com/maps 或 maps.app.goo.gl)。`);
+          return;
+        }
       }
     }
     
@@ -212,13 +211,19 @@ export function Analyzer() {
 
     try {
       const promises = activeUrls.map(async (currentUrl, i) => {
-        let storeName = `自定義店家 ${i + 1}`;
-        try {
-          const match = currentUrl.match(/\/place\/([^\/]+)/);
-          if (match && match[1]) {
-            storeName = decodeURIComponent(match[1].replace(/\+/g, ' '));
+        let storeName = currentUrl;
+        if (currentUrl.startsWith('http://') || currentUrl.startsWith('https://')) {
+          try {
+            const match = currentUrl.match(/\/place\/([^\/]+)/);
+            if (match && match[1]) {
+              storeName = decodeURIComponent(match[1].replace(/\+/g, ' '));
+            } else {
+              storeName = `自定義店家 ${i + 1}`;
+            }
+          } catch (e) {
+            storeName = `自定義店家 ${i + 1}`;
           }
-        } catch (e) {}
+        }
 
         try {
           const response = await fetch('/api/scrape', {
@@ -581,7 +586,7 @@ export function Analyzer() {
                             type="text"
                             value={url}
                             onChange={(e) => handleScrapeUrlChange(index, e.target.value)}
-                            placeholder="https://www.google.com/maps/place/..."
+                            placeholder="請輸入 Google Maps 網址，或直接輸入店家名稱（例如：蘇草salvia）..."
                             className="w-full pl-10 pr-4 py-2.5 bg-white rounded-xl border border-[#d4c5b0] focus:border-[#6b8e7f] focus:ring-1 focus:ring-[#6b8e7f] outline-none text-xs md:text-sm text-[#4a5d52] font-semibold placeholder-[#a0b3a0] transition-shadow shadow-xs"
                           />
                         </div>

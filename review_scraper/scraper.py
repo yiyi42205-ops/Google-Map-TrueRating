@@ -344,8 +344,10 @@ def extract_place_name_from_url(url: str) -> str:
     """
     Extracts the human-readable place name from a Google Maps URL.
     e.g. https://www.google.com/maps/place/%E5%B0%8F%E9%AB%98%E6%8B%89%E9%BA%B5/... -> '小高拉麵'
-    Returns the decoded place name, or empty string if not found.
+    Returns the decoded place name, or the original string if it is already a place name (not a URL).
     """
+    if not url.startswith("http://") and not url.startswith("https://"):
+        return url
     match = re.search(r'/maps/place/([^/@]+)', url)
     if match:
         raw = match.group(1)
@@ -509,9 +511,13 @@ def navigate_to_place_reviews(page, url: str) -> bool:
         page.keyboard.press("Enter")
         time.sleep(8)
     except Exception as e:
-        print(f"[Python Scraper] Failed to search via search box: {e}. Falling back to direct URL navigation.")
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        time.sleep(6)
+        print(f"[Python Scraper] Failed to search via search box: {e}.")
+        if url.startswith("http://") or url.startswith("https://"):
+            print("[Python Scraper] Falling back to direct URL navigation.")
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(6)
+        else:
+            return False
 
     # Check if the search landed directly on a place page (single result)
     if _check_place_loaded(page):
