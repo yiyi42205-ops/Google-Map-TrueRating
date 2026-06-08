@@ -60,15 +60,30 @@ export function auditReview(review: Review): AuditResult {
     }
   }
 
-  // 2. Catch generic "送" but filter out non-incentive terms like "外送", "配送", "送禮", "送給" etc.
-  const excludes = ['外送', '配送', '送禮', '送給', '送餐', '送上', '送來', '送錯', '送客', '送走', '送出', '推送', '面送', '送速度', '送口', '送入'];
-  if (text.includes('送') && !excludes.some(ex => text.includes(ex))) {
-    return {
-      isWashed: true,
-      reason: `直接匹配到打卡/活動/贈送交易關鍵字：『送』。`,
-      confidenceScore: 100,
-      issueType: 'incentive',
-    };
+  // 2. Catch generic "送" only if accompanied by promotional keywords and not part of normal delivery/serving/hospitality terms
+  if (text.includes('送')) {
+    const excludes = [
+      '外送', '配送', '送禮', '送給', '送餐', '送上', '送來', '送錯', '送客', '送走', '送出', 
+      '推送', '面送', '送速度', '送口', '送入', '送到', '送達', '送桌', '補送', '送回', '菜梯送', 
+      '端送', '發送', '傳送', '運送', '送進', '送過', '送風', '陸續送'
+    ];
+    
+    const promoKeywords = [
+      '打卡', '活動', '好評', '評論', '分享', '按讚', '追蹤', '關注', '五星', '五顆星', '5星', '5顆星',
+      '推薦', '留言', '截圖', '貼文', '社群', 'IG', 'FB', '臉書', 'Google', 'google'
+    ];
+    
+    const hasCleanSend = !excludes.some(ex => text.includes(ex));
+    const hasPromoKeyword = promoKeywords.some(kw => text.includes(kw));
+    
+    if (hasCleanSend && hasPromoKeyword) {
+      return {
+        isWashed: true,
+        reason: `直接匹配到打卡/活動/贈送交易關鍵字：『送』。`,
+        confidenceScore: 100,
+        issueType: 'incentive',
+      };
+    }
   }
 
   // 3. Catch extremely short generic empty/template reviews (e.g. "讚", "推", "好吃")
