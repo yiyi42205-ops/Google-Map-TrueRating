@@ -6,3 +6,12 @@ review_scraper/venv
 review_scraper/__pycache__
 .DS_Store
 .vercel
+
+# Production build and environment secrets
+dist/
+dist-ssr/
+.env
+.env.local
+*.local
+.vscode/
+
