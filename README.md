@@ -75,7 +75,20 @@
 ---
 
 ## 快速開始
-～～～～～～～～～～～～～～～～～～～～？？？？？？？？？？？？？？？？！！！
+### 快速啟動腳本（MacOS）
+```
+./run.sh
+```
+
+### 手動啟動 (Windows/MacOS/Linux)
+```
+npm i
+npm run dev
+```
+- (Optional) 若尚未安裝Ollama，在這裡 [下載Ollama](https://ollama.com/download)
+```
+ollama pull gemma4:e4b
+```
 
 啟動後於瀏覽器開啟提示的本機網址,貼上 Google Maps 店家連結即可開始分析。
 
