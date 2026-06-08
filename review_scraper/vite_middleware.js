@@ -121,17 +121,19 @@ export function scraperMiddleware(req, res, next) {
     req.on('end', () => {
       try {
         console.log(`[Audit API] Incoming POST request to /api/audit-local`);
-        const { reviews } = JSON.parse(body);
+        const { reviews, model } = JSON.parse(body);
         if (!reviews || !Array.isArray(reviews)) {
           console.error(`[Audit API] Validation failed: Missing or invalid required field 'reviews'`);
           res.writeHead(400, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ error: 'Missing or invalid required field: reviews' }));
         }
 
+        const selectedModel = model || 'gemma4:e4b';
+
         const prompt = `你是一個專門分析 Google Maps 虛假/灌水/刷好評評論的 AI 安全專家。\n請審查以下給定的評論列表（為 JSON 陣列，每筆包含星等 stars、評論 text、發表時間距今 daysElapsed、是否屬於密集發表期 isSpikePeriod 等特徵資訊）。\n\n【審查指引與洗評判定標準】：\n1. 【利益促銷】：觀察評論是否提及「打卡、評論、五星、好評、免費送、招待、活動」等利益交換詞，且文風有敷衍或流水線寫作痕跡。\n2. 【情感真實度】：極度誇張的讚美（如：全台最好吃、一生推、無懈可擊）但沒有任何具體說明，通常是買評工作室的灌水套話。\n3. 【描述具體度】：真實評論通常會提及具體餐點（如：雞白湯拉麵、起司球）、環境特色（如：好停車、店貓可愛）或排隊等待時間。空洞的好評（如：美味、便宜、讚、推薦）很可疑。\n4. 【時序脈絡】：如果評論在評論密度暴增期（isSpikePeriod為true）發出，且 daysElapsed 天數很接近，表示有極高機率是集中宣傳期的打卡或刷評活動。\n\n請務必強制輸出 JSON 陣列，每一筆對應輸入的評論，欄位包含：\n- username: 評論者名稱\n- isWashed: 是否為洗評或利益交換評論 (true/false)\n- reasoningPath: 強制先寫出你的分析思路與推理過程 (CoT 思維鏈)\n- reason: 最終判定洗評或乾淨口碑的簡短說明字串\n- incentiveIntensity: 利益交換強度 (1-5 分，5為最強烈有打卡送小菜等痕跡)\n- sentimentAuthenticity: 情感表達真實度 (1-5 分，5為最真誠，1為最空洞虛假)\n- descriptionGranularity: 描述具體細緻度 (1-5 分，5為極具體描繪餐點細節，1為極敷衍無細節)\n- issueType: 洗評類型分類 ("incentive" 利益誘因 / "template" 空洞模板 / "discrepancy" 語意割裂 / "none" 乾淨評論)\n\n待審查評論數據：\n${JSON.stringify(reviews, null, 2)}`;
 
         const postData = JSON.stringify({
-          model: 'gemma4:e4b',
+          model: selectedModel,
           messages: [
             {
               role: 'user',
@@ -157,10 +159,10 @@ export function scraperMiddleware(req, res, next) {
         };
 
         const prefix = `[Web UI] 正在分析 ${reviews.length} 則評論...`;
-        console.log(`[Audit API] Sending request to local Ollama (gemma4:e4b) for ${reviews.length} reviews...`);
+        console.log(`[Audit API] Sending request to local Ollama (${selectedModel}) for ${reviews.length} reviews...`);
         statsMonitor.setStoreInfo(prefix);
         statsMonitor.start();
-        statsMonitor.setLLMMetrics('gemma4:e4b', 'Local (Ollama)', 0);
+        statsMonitor.setLLMMetrics(selectedModel, 'Local (Ollama)', 0);
         const startTime = Date.now();
 
         const ollamaReq = http.request(options, (ollamaRes) => {
@@ -226,7 +228,7 @@ export function scraperMiddleware(req, res, next) {
               
               const durationSec = Math.max(0.1, (Date.now() - startTime) / 1000);
               const estimatedTokens = data.length / 4;
-              statsMonitor.setLLMMetrics('gemma4:e4b', 'Local (Ollama)', estimatedTokens / durationSec);
+              statsMonitor.setLLMMetrics(selectedModel, 'Local (Ollama)', estimatedTokens / durationSec);
               const summary = statsMonitor.getSummaryString();
               console.log(`[Audit API] Successfully audited ${parsedContent.length} reviews in ${durationSec.toFixed(2)}s (${summary})`);
 

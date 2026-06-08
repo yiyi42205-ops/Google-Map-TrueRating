@@ -70,6 +70,7 @@ def audit_local():
     
     data = request.get_json() or {}
     reviews = data.get("reviews")
+    model = data.get("model") or "gemma4:e4b"
     if not reviews or not isinstance(reviews, list):
         logger.error(f"Audit request from {ip} failed validation: Missing or invalid required field 'reviews'")
         return jsonify({"error": "Missing or invalid required field: reviews"}), 400
@@ -93,7 +94,7 @@ def audit_local():
     )
 
     ollama_payload = {
-        "model": "gemma4:e4b",
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -108,7 +109,7 @@ def audit_local():
     }
 
     try:
-        logger.info(f"Forwarding audit request of {len(reviews)} reviews to local Ollama (gemma4:e4b)...")
+        logger.info(f"Forwarding audit request of {len(reviews)} reviews to local Ollama ({model})...")
         response = requests.post(
             "http://127.0.0.1:11434/api/chat",
             json=ollama_payload,

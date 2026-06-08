@@ -52,13 +52,32 @@ else
     status_success "Node.js is installed ($NODE_VER)"
 fi
 
-# Check Python3
-if ! command -v python3 &> /dev/null; then
-    status_error "Python 3 is not installed. Please install Python 3 and try again."
-    exit 1
+# Check Python3 (prefer python 3.10 to 3.13, avoiding pre-releases/unsupported like 3.14+)
+status_info "Detecting compatible Python 3 version..."
+PYTHON_CMD=""
+for cmd in python3.13 python3.12 python3.11 python3.10 python3; do
+    if command -v "$cmd" &> /dev/null; then
+        VER_STR=$("$cmd" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
+        major=$(echo "$VER_STR" | cut -d. -f1)
+        minor=$(echo "$VER_STR" | cut -d. -f2)
+        if [ "$major" -eq 3 ] && [ "$minor" -le 13 ] && [ "$minor" -ge 9 ]; then
+            PYTHON_CMD="$cmd"
+            break
+        fi
+    fi
+done
+
+if [ -z "$PYTHON_CMD" ]; then
+    if command -v python3 &> /dev/null; then
+        PYTHON_CMD="python3"
+        status_warning "No Python 3.9-3.13 installation found. Falling back to default python3: $($PYTHON_CMD --version)"
+    else
+        status_error "Python 3 is not installed. Please install Python 3 (preferably 3.10-3.13) and try again."
+        exit 1
+    fi
 else
-    PYTHON_VER=$(python3 --version)
-    status_success "Python 3 is installed ($PYTHON_VER)"
+    PYTHON_VER=$($PYTHON_CMD --version)
+    status_success "Found compatible Python: $PYTHON_CMD ($PYTHON_VER)"
 fi
 
 echo
@@ -107,8 +126,17 @@ fi
 # Setup Python Virtual Environment and Install Dependencies
 if [[ "$INSTALL_PYTHON" =~ ^[yY]$ ]]; then
     status_info "Setting up Python virtual environment..."
+    if [ -d "review_scraper/venv" ]; then
+        # Check if venv python version matches the selected python version
+        VENV_PY_VER=$(review_scraper/venv/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
+        SELECTED_PY_VER=$($PYTHON_CMD -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
+        if [ "$VENV_PY_VER" != "$SELECTED_PY_VER" ]; then
+            status_warning "Python version changed (venv was $VENV_PY_VER, selected is $SELECTED_PY_VER). Recreating virtual environment..."
+            rm -rf review_scraper/venv
+        fi
+    fi
     if [ ! -d "review_scraper/venv" ]; then
-        python3 -m venv review_scraper/venv
+        $PYTHON_CMD -m venv review_scraper/venv
     fi
     
     status_info "Installing Python dependencies (requirements.txt)..."

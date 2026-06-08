@@ -328,65 +328,28 @@ export function Results() {
               }
             }
           } else {
-            const response = await fetch('/api/ollama/api/chat', {
+            const response = await fetch('/api/audit-local', {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json'
               },
               body: JSON.stringify({
-                model: ollamaModelTag,
-                messages: [
-                  {
-                    role: 'user',
-                    content: prompt
-                  }
-                ],
-                options: {
-                  temperature: 0.1
-                },
-                format: 'json',
-                stream: false
+                reviews: promptPayload,
+                model: ollamaModelTag
               })
             });
 
             if (!response.ok) {
-              const errText = await response.text().catch(() => '');
-              throw new Error(`本地 Ollama 服務回傳錯誤，請確認本機 Ollama 運作中且已下載模型 "${ollamaModelTag}"。${errText ? `錯誤訊息: ${errText}` : ''}`);
+              const errData = await response.json().catch(() => null);
+              throw new Error(`本地 Ollama 服務回傳錯誤，請確認本機 Ollama 運作中且已下載模型 "${ollamaModelTag}"。${errData?.error || errData?.details || ''}`);
             }
 
             const responseJson = await response.json();
-            if (!responseJson.message || !responseJson.message.content) {
+            if (!responseJson.results && !responseJson.result) {
               throw new Error('本地 Ollama 回傳資料格式不正確');
             }
             
-            let contentStr = responseJson.message.content.trim();
-            // Strip markdown fences
-            if (contentStr.startsWith('```')) {
-              contentStr = contentStr.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
-            }
-            
-            // Extract JSON array or object using regex to ignore any surrounding chat text
-            const arrayMatch = contentStr.match(/\[\s*\{[\s\S]*\}\s*\]/);
-            if (arrayMatch) {
-              contentStr = arrayMatch[0];
-            } else {
-              const objMatch = contentStr.match(/\{\s*[\s\S]*\}/);
-              if (objMatch) {
-                contentStr = objMatch[0];
-              }
-            }
-            
-            let parsedContent;
-            try {
-              parsedContent = JSON.parse(sanitizeJsonString(contentStr));
-            } catch (e) {
-              try {
-                parsedContent = JSON.parse(closeMalformedJson(sanitizeJsonString(contentStr)));
-              } catch (e2) {
-                console.error("Failed to parse local Ollama response. Raw string:", contentStr);
-                throw new Error(`本地 Ollama 語意審計失敗，模型回傳格式非合規 JSON：\n${e2.message || e2}`);
-              }
-            }
+            let parsedContent = responseJson.results || responseJson.result;
             
             // Normalize array if model wrapped it in an object like {"reviews": [...]}
             if (!Array.isArray(parsedContent)) {
